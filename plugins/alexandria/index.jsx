@@ -25,6 +25,7 @@ const {
 
 const ARCHIVE_KEY = "entries";
 const launcherId = "alexandria-launcher-host";
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 
 store[ARCHIVE_KEY] ??= [];
 store.captureEnabled ??= true;
@@ -32,9 +33,15 @@ store.showButton ??= true;
 store.sortMode ??= "deletedAt";
 store.serverFilter ??= "";
 store.userFilter ??= "";
+store.photoBackfillEnabled ??= false;
+store.keepDeletedInSession ??= false;
 
 let launcherHost;
 let removeModal;
+const photoCapturesInFlight = new Set();
+const queuedPhotoCaptures = new Set();
+const photoCaptureQueue = [];
+let activePhotoCaptures = 0;
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
@@ -43,12 +50,36 @@ function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
 }
 
-function normaliseAttachment(attachment) {
+function imageTypeFromFilename(filename) {
+  const extension = filename.split(".").pop()?.toLowerCase();
   return {
-    filename: asString(attachment?.filename || attachment?.name, "Attachment"),
-    url: asString(attachment?.url),
-    contentType: asString(attachment?.content_type || attachment?.contentType),
+    avif: "image/avif",
+    gif: "image/gif",
+    jpeg: "image/jpeg",
+    jpg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+  }[extension] || "";
+}
+
+function normaliseAttachment(attachment) {
+  const filename = asString(attachment?.filename || attachment?.name, "Attachment");
+  const contentType = asString(attachment?.content_type || attachment?.contentType);
+  const url = asString(attachment?.url);
+  const proxyUrl = asString(attachment?.proxy_url || attachment?.proxyUrl);
+
+  return {
+    id: asString(attachment?.id),
+    filename,
+    url,
+    proxyUrl,
+    contentType,
+    isImage: contentType.startsWith("image/") || Boolean(imageTypeFromFilename(filename)),
   };
+}
+
+function attachmentKey(attachment) {
+  return attachment.id || attachment.url || attachment.proxyUrl;
 }
 
 function normaliseEmbed(embed) {
@@ -100,6 +131,128 @@ function sameJSON(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function mergeAttachments(incoming, previous = []) {
+  return incoming.map((attachment) => {
+    const captured = previous.find((item) => attachmentKey(item) === attachmentKey(attachment));
+    return captured?.dataUrl ? { ...attachment, dataUrl: captured.dataUrl } : attachment;
+  });
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function setPhotoCaptureStatus(messageId, key, photoUnavailable) {
+  const current = entries();
+  const entryIndex = current.findIndex((entry) => entry.id === messageId);
+  if (entryIndex === -1) return;
+
+  const attachments = current[entryIndex].attachments.map((item) =>
+    attachmentKey(item) === key ? { ...item, photoUnavailable } : item,
+  );
+  if (sameJSON(attachments, current[entryIndex].attachments)) return;
+
+  const next = [...current];
+  next[entryIndex] = { ...next[entryIndex], attachments };
+  store[ARCHIVE_KEY] = next;
+}
+
+async function cachePhoto(messageId, attachment) {
+  const sourceUrls = [...new Set([attachment.proxyUrl, attachment.url].filter(Boolean))];
+  if (!attachment.isImage || sourceUrls.length === 0) return;
+
+  const key = attachmentKey(attachment);
+  const captureKey = `${messageId}:${key}`;
+  if (photoCapturesInFlight.has(captureKey)) return;
+  photoCapturesInFlight.add(captureKey);
+
+  try {
+    let blob;
+
+    for (const sourceUrl of sourceUrls) {
+      const response = await fetch(sourceUrl);
+      const contentLength = Number(response.headers.get("content-length"));
+      if (!response.ok || (contentLength && contentLength > MAX_PHOTO_BYTES)) continue;
+
+      const candidate = await response.blob();
+      if (candidate.size > MAX_PHOTO_BYTES) continue;
+
+      // Discord may serve an image as application/octet-stream. The attachment
+      // metadata is still authoritative, so retain it with that image type.
+      const imageType = candidate.type.startsWith("image/")
+        ? candidate.type
+        : attachment.contentType.startsWith("image/")
+          ? attachment.contentType
+          : imageTypeFromFilename(attachment.filename);
+      if (!imageType) continue;
+
+      blob = new Blob([candidate], { type: imageType });
+      break;
+    }
+
+    if (!blob) {
+      setPhotoCaptureStatus(messageId, key, true);
+      return;
+    }
+
+    const dataUrl = await readBlobAsDataUrl(blob);
+    const current = entries();
+    const entryIndex = current.findIndex((entry) => entry.id === messageId);
+    if (entryIndex === -1) return;
+
+    const attachments = current[entryIndex].attachments.map((item) =>
+      attachmentKey(item) === key && !item.dataUrl ? { ...item, dataUrl, photoUnavailable: false } : item,
+    );
+    if (sameJSON(attachments, current[entryIndex].attachments)) return;
+
+    const next = [...current];
+    next[entryIndex] = { ...next[entryIndex], attachments };
+    store[ARCHIVE_KEY] = next;
+  } catch {
+    // A CDN request can fail after a message is deleted. Keep a visible status
+    // instead of presenting the expiring remote link as archived content.
+    setPhotoCaptureStatus(messageId, key, true);
+  } finally {
+    photoCapturesInFlight.delete(captureKey);
+  }
+}
+
+function cachePhotos(messageId, attachments) {
+  attachments.forEach((attachment) => {
+    if (!attachment.isImage || attachment.dataUrl) return;
+
+    const captureKey = `${messageId}:${attachmentKey(attachment)}`;
+    if (photoCapturesInFlight.has(captureKey) || queuedPhotoCaptures.has(captureKey)) return;
+
+    queuedPhotoCaptures.add(captureKey);
+    photoCaptureQueue.push({ messageId, attachment, captureKey });
+  });
+
+  drainPhotoCaptureQueue();
+}
+
+function drainPhotoCaptureQueue() {
+  while (activePhotoCaptures < 3 && photoCaptureQueue.length) {
+    const { messageId, attachment, captureKey } = photoCaptureQueue.shift();
+    queuedPhotoCaptures.delete(captureKey);
+    activePhotoCaptures += 1;
+
+    void cachePhoto(messageId, attachment).finally(() => {
+      activePhotoCaptures -= 1;
+      drainPhotoCaptureQueue();
+    });
+  }
+}
+
+function backfillArchivedPhotos() {
+  entries().forEach((entry) => cachePhotos(entry.id, entry.attachments || []));
+}
+
 function saveMessage(message) {
   if (store.captureEnabled === false) return;
 
@@ -111,6 +264,7 @@ function saveMessage(message) {
 
   if (index === -1) {
     store[ARCHIVE_KEY] = [...current, { ...incoming, deleted: false, deletedAt: null }];
+    cachePhotos(incoming.id, incoming.attachments);
     return;
   }
 
@@ -120,18 +274,24 @@ function saveMessage(message) {
     ...incoming,
     // MESSAGE_UPDATE payloads are often partial. Preserve richer data already captured.
     content: incoming.content || previous.content,
-    attachments: incoming.attachments.length ? incoming.attachments : previous.attachments,
+    attachments: incoming.attachments.length
+      ? mergeAttachments(incoming.attachments, previous.attachments)
+      : previous.attachments,
     embeds: incoming.embeds.length ? incoming.embeds : previous.embeds,
     guildName: incoming.guildName || previous.guildName || "",
     deleted: previous.deleted === true,
     deletedAt: previous.deletedAt || null,
   };
 
-  if (sameJSON(previous, updated)) return;
+  if (sameJSON(previous, updated)) {
+    cachePhotos(incoming.id, updated.attachments);
+    return;
+  }
 
   const next = [...current];
   next[index] = updated;
   store[ARCHIVE_KEY] = next;
+  cachePhotos(incoming.id, updated.attachments);
 }
 
 function messageFromStore(id, channelId) {
@@ -157,7 +317,7 @@ function messageFromStore(id, channelId) {
 }
 
 function markDeleted(id, channelId) {
-  if (!id) return;
+  if (!id) return false;
 
   const messageId = asString(id);
   let current = entries();
@@ -175,7 +335,8 @@ function markDeleted(id, channelId) {
     }
   }
 
-  if (index === -1 || current[index].deleted) return;
+  if (index === -1) return false;
+  if (current[index].deleted) return true;
 
   const next = [...current];
   next[index] = {
@@ -184,6 +345,7 @@ function markDeleted(id, channelId) {
     deletedAt: new Date().toISOString(),
   };
   store[ARCHIVE_KEY] = next;
+  return true;
 }
 
 function messageFromPayload(payload) {
@@ -207,14 +369,24 @@ function handleDispatch(payload) {
   }
 
   if (payload.type === "MESSAGE_DELETE") {
-    markDeleted(payload.id || payload.message?.id, payload.channel_id || payload.channelId || payload.message?.channel_id);
+    const archived = markDeleted(
+      payload.id || payload.message?.id,
+      payload.channel_id || payload.channelId || payload.message?.channel_id,
+    );
+    // Shelter lets a Flux interceptor stop a dispatch by returning false. This
+    // retains the message in Discord's in-memory store until a client restart,
+    // mirroring MessageLogger's session-only behavior.
+    if (store.keepDeletedInSession && archived) return false;
     return;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
     const ids = payload.ids || payload.messageIds || payload.messages;
     const channelId = payload.channel_id || payload.channelId;
-    if (Array.isArray(ids)) ids.forEach((id) => markDeleted(id?.id || id, id?.channel_id || channelId));
+    if (Array.isArray(ids)) {
+      const archived = ids.map((id) => markDeleted(id?.id || id, id?.channel_id || channelId));
+      if (store.keepDeletedInSession && archived.length > 0 && archived.every(Boolean)) return false;
+    }
   }
 }
 
@@ -537,7 +709,33 @@ function ArchiveModal(props) {
                   <Show when={entry.attachments?.length}>
                     <div class="alexandria-extra">
                       <For each={entry.attachments}>
-                        {(attachment) => <div class="alexandria-extra-item">↗ {attachment.filename}</div>}
+                        {(attachment) => (
+                          <Show
+                            when={attachment.isImage}
+                            fallback={<div class="alexandria-extra-item">↗ {attachment.filename}</div>}
+                          >
+                            <Show
+                              when={attachment.dataUrl}
+                              fallback={
+                                <div class="alexandria-extra-item alexandria-photo-status">
+                                  {attachment.photoUnavailable
+                                    ? "Photo could not be saved locally."
+                                    : "Saving photo locally…"}
+                                </div>
+                              }
+                            >
+                              <a
+                                class="alexandria-photo"
+                                href={attachment.dataUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                title={attachment.filename}
+                              >
+                                <img src={attachment.dataUrl} alt={attachment.filename} />
+                              </a>
+                            </Show>
+                          </Show>
+                        )}
                       </For>
                     </div>
                   </Show>
@@ -558,6 +756,7 @@ function ArchiveModal(props) {
 
 function openArchive() {
   captureLoadedMessages();
+  if (store.photoBackfillEnabled) backfillArchivedPhotos();
   removeModal?.();
   removeModal = openModal((props) => <ArchiveModal {...props} />);
 }
@@ -652,6 +851,25 @@ export const settings = () => (
       note="The button only opens the archive; closing it hides the archive again."
     >
       Show Alexandria launcher
+    </SwitchItem>
+    <SwitchItem
+      checked={store.photoBackfillEnabled}
+      onChange={(value) => {
+        store.photoBackfillEnabled = value;
+        if (value) backfillArchivedPhotos();
+      }}
+      note="Try to save local copies of photos from earlier archive entries while their Discord media is still available. Downloads run three at a time."
+    >
+      Backfill archived photos
+    </SwitchItem>
+    <SwitchItem
+      checked={store.keepDeletedInSession}
+      onChange={(value) => {
+        store.keepDeletedInSession = value;
+      }}
+      note="Keep messages Alexandria captures in Discord's in-memory cache until the client restarts. They remain visible in chat and may appear undeleted."
+    >
+      Keep deleted messages for this session
     </SwitchItem>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
