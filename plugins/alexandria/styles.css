@@ -17,12 +17,14 @@
   color: #fff;
   background: var(--brand-experiment, #5865f2);
   box-shadow: 0 8px 20px rgb(0 0 0 / 28%);
-  cursor: pointer;
+  cursor: grab;
   font: inherit;
   font-size: 14px;
   font-weight: 700;
   letter-spacing: -0.01em;
   pointer-events: auto;
+  touch-action: none;
+  user-select: none;
   transition: box-shadow 160ms ease, filter 160ms ease, transform 160ms ease;
 }
 
@@ -33,6 +35,7 @@
 }
 
 .alexandria-launcher:active { transform: translateY(0); }
+.alexandria-launcher.is-dragging { cursor: grabbing; filter: brightness(1.08); transform: none; }
 .alexandria-launcher:focus-visible { outline: 3px solid rgb(255 255 255 / 85%); outline-offset: 3px; }
 .alexandria-launcher-icon { width: 18px; height: 18px; fill: currentColor; }
 

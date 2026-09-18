@@ -46,10 +46,13 @@ store.serverFilter ??= "";
 store.userFilter ??= "";
 store.directMessageFilter ??= "";
 store.photoBackfillEnabled ??= false;
+store.launcherPosition ??= null;
 
 let launcherHost;
 let removeModal;
 let removePhotoModal;
+let stopLauncherDrag;
+let suppressLauncherClick = false;
 const photoCapturesInFlight = new Set();
 const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
@@ -1537,6 +1540,89 @@ async function clearArchive() {
   }
 }
 
+function clampLauncherPosition(x, y, button) {
+  const margin = 8;
+  return {
+    x: Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - button.offsetWidth - margin)),
+    y: Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - button.offsetHeight - margin)),
+  };
+}
+
+function placeLauncher(x, y, persist = false) {
+  const button = launcherHost?.querySelector(".alexandria-launcher");
+  if (!button) return;
+
+  const position = clampLauncherPosition(x, y, button);
+  launcherHost.style.left = `${position.x}px`;
+  launcherHost.style.top = `${position.y}px`;
+  launcherHost.style.right = "auto";
+  launcherHost.style.bottom = "auto";
+  if (persist) store.launcherPosition = position;
+}
+
+function restoreLauncherPosition() {
+  const position = store.launcherPosition;
+  if (!Number.isFinite(position?.x) || !Number.isFinite(position?.y)) return;
+  placeLauncher(position.x, position.y, true);
+}
+
+function beginLauncherDrag(event) {
+  if (event.button !== 0 || !event.isPrimary) return;
+
+  const button = event.currentTarget;
+  const start = { x: event.clientX, y: event.clientY };
+  const rect = launcherHost.getBoundingClientRect();
+  let moved = false;
+
+  stopLauncherDrag?.();
+  button.setPointerCapture?.(event.pointerId);
+
+  const onMove = (moveEvent) => {
+    if (moveEvent.pointerId !== event.pointerId) return;
+    const deltaX = moveEvent.clientX - start.x;
+    const deltaY = moveEvent.clientY - start.y;
+
+    if (!moved && Math.hypot(deltaX, deltaY) < 4) return;
+    moved = true;
+    button.classList.add("is-dragging");
+    placeLauncher(rect.left + deltaX, rect.top + deltaY);
+  };
+
+  const finish = (upEvent) => {
+    if (upEvent.pointerId !== event.pointerId) return;
+    if (moved) {
+      const finalRect = launcherHost.getBoundingClientRect();
+      placeLauncher(finalRect.left, finalRect.top, true);
+      suppressLauncherClick = true;
+      setTimeout(() => {
+        suppressLauncherClick = false;
+      }, 0);
+    }
+    stopLauncherDrag?.();
+  };
+
+  stopLauncherDrag = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", finish);
+    window.removeEventListener("pointercancel", finish);
+    button.classList.remove("is-dragging");
+    stopLauncherDrag = null;
+  };
+
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", finish);
+  window.addEventListener("pointercancel", finish);
+}
+
+function handleLauncherClick(event) {
+  if (suppressLauncherClick) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
+  openArchive();
+}
+
 function mountLauncher() {
   document.getElementById(launcherId)?.remove();
   launcherHost = document.createElement("div");
@@ -1545,7 +1631,14 @@ function mountLauncher() {
   launcherHost.append(
     <ReactiveRoot>
       <Show when={store.showButton}>
-        <button class="alexandria-launcher" onClick={openArchive} aria-label="Open Alexandria archive">
+        <button
+          class="alexandria-launcher"
+          ref={() => requestAnimationFrame(restoreLauncherPosition)}
+          onClick={handleLauncherClick}
+          onPointerDown={beginLauncherDrag}
+          aria-label="Open Alexandria archive; drag to move"
+          title="Drag to move · Click to open"
+        >
           <svg class="alexandria-launcher-icon" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M4.5 5.75A2.75 2.75 0 0 1 7.25 3H11v15H7.25A2.75 2.75 0 0 0 4.5 20.75V5.75Zm15 0A2.75 2.75 0 0 0 16.75 3H13v15h3.75a2.75 2.75 0 0 1 2.75 2.75V5.75Z" />
             <path d="M4.5 20.75c0-.76.62-1.38 1.38-1.38H11v1.63H5.88A1.38 1.38 0 0 1 4.5 19.62v1.13Zm15 0c0-.76-.62-1.38-1.38-1.38H13v1.63h5.12a1.38 1.38 0 0 0 1.38-1.38v1.13Z" />
@@ -1567,6 +1660,11 @@ export function onLoad() {
   // MessageLogger-style deleted-message treatment.
   document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
   scoped.onDispose(clearRenderedDeletedStyles);
+  window.addEventListener("resize", restoreLauncherPosition);
+  scoped.onDispose(() => {
+    window.removeEventListener("resize", restoreLauncherPosition);
+    stopLauncherDrag?.();
+  });
 
   const unobserve = scoped.observeDom(
     '[id^="message-username-"], [id^="message-content-"]',
