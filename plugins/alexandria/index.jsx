@@ -1,4 +1,4 @@
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createEffect, createSignal } from "solid-js";
 import styles from "./styles.css";
 
 const {
@@ -807,6 +807,11 @@ function SearchablePicker(props) {
   const selectedLabel = () => props.options().find((option) => option.value === props.value)?.label || "";
   const [inputValue, setInputValue] = createSignal(selectedLabel());
 
+  createEffect(() => {
+    const value = props.value;
+    setInputValue(value ? selectedLabel() : "");
+  });
+
   function updateInput(value) {
     setInputValue(value);
     const match = props.options().find(
@@ -1033,49 +1038,53 @@ function CaptureScopeSettings() {
 
       <Show when={mode() === "selected"}>
         <div class="alexandria-scope-columns">
-          <fieldset class="alexandria-scope-list">
-            <legend>Servers</legend>
-            <Show when={guildChoices().length} fallback={<span class="alexandria-scope-empty">No servers found</span>}>
-              <For each={guildChoices()}>
-                {(choice) => (
-                  <label class="alexandria-scope-choice">
-                    <input
-                      type="checkbox"
-                      checked={guildIds().includes(choice.value)}
-                      onChange={(event) =>
-                        toggleChoice("selectedGuildIds", choice.value, event.currentTarget.checked, setGuildIds)
-                      }
-                    />
-                    <span>{choice.label}</span>
-                  </label>
-                )}
-              </For>
-            </Show>
-          </fieldset>
-          <fieldset class="alexandria-scope-list">
-            <legend>Direct messages</legend>
-            <Show when={directMessageChoices().length} fallback={<span class="alexandria-scope-empty">No direct messages found</span>}>
-              <For each={directMessageChoices()}>
-                {(choice) => (
-                  <label class="alexandria-scope-choice">
-                    <input
-                      type="checkbox"
-                      checked={directMessageIds().includes(choice.value)}
-                      onChange={(event) =>
-                        toggleChoice(
-                          "selectedDirectMessageIds",
-                          choice.value,
-                          event.currentTarget.checked,
-                          setDirectMessageIds,
-                        )
-                      }
-                    />
-                    <span>{choice.label}</span>
-                  </label>
-                )}
-              </For>
-            </Show>
-          </fieldset>
+          <section class="alexandria-scope-group" aria-labelledby="alexandria-servers-heading">
+            <h3 id="alexandria-servers-heading" class="alexandria-scope-heading">Servers</h3>
+            <div class="alexandria-scope-list">
+              <Show when={guildChoices().length} fallback={<span class="alexandria-scope-empty">No servers found</span>}>
+                <For each={guildChoices()}>
+                  {(choice) => (
+                    <label class="alexandria-scope-choice">
+                      <input
+                        type="checkbox"
+                        checked={guildIds().includes(choice.value)}
+                        onChange={(event) =>
+                          toggleChoice("selectedGuildIds", choice.value, event.currentTarget.checked, setGuildIds)
+                        }
+                      />
+                      <span>{choice.label}</span>
+                    </label>
+                  )}
+                </For>
+              </Show>
+            </div>
+          </section>
+          <section class="alexandria-scope-group" aria-labelledby="alexandria-direct-messages-heading">
+            <h3 id="alexandria-direct-messages-heading" class="alexandria-scope-heading">Direct messages</h3>
+            <div class="alexandria-scope-list">
+              <Show when={directMessageChoices().length} fallback={<span class="alexandria-scope-empty">No direct messages found</span>}>
+                <For each={directMessageChoices()}>
+                  {(choice) => (
+                    <label class="alexandria-scope-choice">
+                      <input
+                        type="checkbox"
+                        checked={directMessageIds().includes(choice.value)}
+                        onChange={(event) =>
+                          toggleChoice(
+                            "selectedDirectMessageIds",
+                            choice.value,
+                            event.currentTarget.checked,
+                            setDirectMessageIds,
+                          )
+                        }
+                      />
+                      <span>{choice.label}</span>
+                    </label>
+                  )}
+                </For>
+              </Show>
+            </div>
+          </section>
         </div>
       </Show>
     </section>
@@ -1162,92 +1171,147 @@ function ArchiveModal(props) {
       });
   };
 
+  const activeFilterCount = () =>
+    [query().trim(), selectedServer(), selectedUser(), selectedDirectMessage()].filter(Boolean).length;
+
+  const resetFilters = () => {
+    setQuery("");
+    setSelectedServer("");
+    setSelectedUser("");
+    setSelectedDirectMessage("");
+    store.serverFilter = "";
+    store.userFilter = "";
+    store.directMessageFilter = "";
+  };
+
   return (
     <ModalRoot size={ModalSizes.LARGE} class="alexandria-modal">
-      <ModalHeader close={props.close}>Alexandria archive</ModalHeader>
-      <ModalBody>
-        <div class="alexandria-search">
-          <TextBox
-            value={query()}
-            placeholder="Search messages, people, or channels"
-            aria-label="Search the Alexandria archive"
-            onInput={setQuery}
-          />
+      <ModalHeader close={props.close}>
+        <div class="alexandria-modal-title">
+          <span class="alexandria-modal-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M5.5 5.75A2.75 2.75 0 0 1 8.25 3H11v15H8.25a2.75 2.75 0 0 0-2.75 2.75v-15Zm13 0A2.75 2.75 0 0 0 15.75 3H13v15h2.75a2.75 2.75 0 0 1 2.75 2.75v-15Z" />
+            </svg>
+          </span>
+          <span>
+            <strong>Alexandria</strong>
+            <small>Message archive</small>
+          </span>
         </div>
-        <div class="alexandria-toolbar">
-          <Button
-            size={ButtonSizes.MIN}
-            color={ButtonColors.SECONDARY}
-            onClick={() => setShowAll((value) => !value)}
-          >
-            {showAll() ? "Deleted only" : "Show all captured"}
-          </Button>
-          <SearchablePicker
-            id="alexandria-server-filter"
-            value={selectedServer()}
-            options={serverOptions}
-            placeholder="Search servers"
-            ariaLabel="Filter Alexandria archive by server"
-            onChange={(value) => {
-              const server = String(value);
-              setSelectedServer(server);
-              store.serverFilter = server;
-            }}
-          />
-          <SearchablePicker
-            id="alexandria-user-filter"
-            value={selectedUser()}
-            options={userOptions}
-            placeholder="Search users"
-            ariaLabel="Filter Alexandria archive by user"
-            onChange={(value) => {
-              const user = String(value);
-              setSelectedUser(user);
-              store.userFilter = user;
-            }}
-          />
-          <SearchablePicker
-            id="alexandria-direct-message-filter"
-            value={selectedDirectMessage()}
-            options={directMessageOptions}
-            placeholder="Search direct messages"
-            ariaLabel="Filter Alexandria archive by direct message"
-            onChange={(value) => {
-              const directMessage = String(value);
-              setSelectedDirectMessage(directMessage);
-              store.directMessageFilter = directMessage;
-            }}
-          />
-          <Select
-            value={sortMode()}
-            aria-label="Sort Alexandria archive"
-            onChange={(value) => {
-              const mode = String(value);
-              setSortMode(mode);
-              store.sortMode = mode;
-            }}
-          >
-            <SelectOption value="deletedAt">Sort by deletion date</SelectOption>
-            <SelectOption value="user">Sort by user</SelectOption>
-            <SelectOption value="server">Sort by server name</SelectOption>
-          </Select>
+      </ModalHeader>
+      <ModalBody>
+        <div class="alexandria-overview" aria-label="Archive overview">
+          <div class="alexandria-overview-copy">
+            <span class="alexandria-eyebrow">Local archive</span>
+            <strong>{archiveCount()} deleted message{archiveCount() === 1 ? "" : "s"} preserved</strong>
+            <p>Search what Alexandria captured, then narrow it by conversation or person.</p>
+          </div>
+          <div class="alexandria-stat" title="Total messages currently stored">
+            <span>{capturedCount()}</span>
+            <small>captured</small>
+          </div>
+        </div>
+
+        <div class="alexandria-filter-panel">
+          <div class="alexandria-search">
+            <span class="alexandria-search-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m20 20-4.3-4.3m2.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" /></svg>
+            </span>
+            <TextBox
+              value={query()}
+              placeholder="Search messages, people, or channels…"
+              aria-label="Search the Alexandria archive"
+              onInput={setQuery}
+            />
+          </div>
+          <div class="alexandria-toolbar">
+            <SearchablePicker
+              id="alexandria-server-filter"
+              value={selectedServer()}
+              options={serverOptions}
+              placeholder="All servers"
+              ariaLabel="Filter Alexandria archive by server"
+              onChange={(value) => {
+                const server = String(value);
+                setSelectedServer(server);
+                store.serverFilter = server;
+              }}
+            />
+            <SearchablePicker
+              id="alexandria-user-filter"
+              value={selectedUser()}
+              options={userOptions}
+              placeholder="All people"
+              ariaLabel="Filter Alexandria archive by user"
+              onChange={(value) => {
+                const user = String(value);
+                setSelectedUser(user);
+                store.userFilter = user;
+              }}
+            />
+            <SearchablePicker
+              id="alexandria-direct-message-filter"
+              value={selectedDirectMessage()}
+              options={directMessageOptions}
+              placeholder="All direct messages"
+              ariaLabel="Filter Alexandria archive by direct message"
+              onChange={(value) => {
+                const directMessage = String(value);
+                setSelectedDirectMessage(directMessage);
+                store.directMessageFilter = directMessage;
+              }}
+            />
+            <Select
+              value={sortMode()}
+              aria-label="Sort Alexandria archive"
+              onChange={(value) => {
+                const mode = String(value);
+                setSortMode(mode);
+                store.sortMode = mode;
+              }}
+            >
+              <SelectOption value="deletedAt">Newest activity</SelectOption>
+              <SelectOption value="user">Person A–Z</SelectOption>
+              <SelectOption value="server">Server A–Z</SelectOption>
+            </Select>
+          </div>
         </div>
 
         <div class="alexandria-summary">
-          <span>{capturedCount()} message{capturedCount() === 1 ? "" : "s"} captured</span>
-          <span>
-            {showAll() ? "Showing all saved messages" : "Showing deleted messages only"}
-            {selectedServer() && ` · ${serverOptions().find((server) => server.value === selectedServer())?.label || "Selected server"}`}
-            {selectedUser() && ` · ${userOptions().find((user) => user.value === selectedUser())?.label || "Selected user"}`}
-            {selectedDirectMessage() && ` · ${directMessageOptions().find((directMessage) => directMessage.value === selectedDirectMessage())?.label || "Selected direct message"}`}
+          <div class="alexandria-view-toggle" role="group" aria-label="Choose which messages to show">
+            <button classList={{ active: !showAll() }} type="button" onClick={() => setShowAll(false)}>
+              Deleted
+            </button>
+            <button classList={{ active: showAll() }} type="button" onClick={() => setShowAll(true)}>
+              All captured
+            </button>
+          </div>
+          <span class="alexandria-result-count">
+            <strong>{visibleEntries().length}</strong> result{visibleEntries().length === 1 ? "" : "s"}
           </span>
+          <Show when={activeFilterCount() > 0}>
+            <button class="alexandria-clear-filters" type="button" onClick={resetFilters}>
+              Clear filters <span>{activeFilterCount()}</span>
+            </button>
+          </Show>
         </div>
 
         <Show
           when={visibleEntries().length > 0}
           fallback={
             <div class="alexandria-empty">
-              {showAll() ? "No captured messages match your search." : "No deleted messages have been captured yet."}
+              <span class="alexandria-empty-icon" aria-hidden="true">⌕</span>
+              <strong>{activeFilterCount() ? "No matching messages" : "Nothing archived yet"}</strong>
+              <p>
+                {activeFilterCount()
+                  ? "Try a broader search or clear the active filters."
+                  : showAll()
+                    ? "Captured messages will appear here as Alexandria sees them."
+                    : "Deleted messages will appear here after Alexandria captures them."}
+              </p>
+              <Show when={activeFilterCount() > 0}>
+                <button type="button" onClick={resetFilters}>Clear all filters</button>
+              </Show>
             </div>
           }
         >
@@ -1268,21 +1332,11 @@ function ArchiveModal(props) {
                     <span class="alexandria-status">{entry.deleted ? "Deleted" : "Saved"}</span>
                   </div>
                   <div class="alexandria-meta">
-                    <time datetime={entry.timestamp}>{formatDate(entry.timestamp)}</time>
+                    <span class="alexandria-location">{channelLabel(entry)}</span>
+                    <time datetime={entry.timestamp}>Sent {formatDate(entry.timestamp)}</time>
                     <Show when={entry.deletedAt}>
                       <time datetime={entry.deletedAt}>Removed {formatDate(entry.deletedAt)}</time>
                     </Show>
-                    <span>{channelLabel(entry)}</span>
-                  </div>
-                  <div class="alexandria-entry-actions">
-                    <button
-                      class="alexandria-remove-entry"
-                      type="button"
-                      onClick={() => removeArchiveEntry(entry.id)}
-                      aria-label={`Remove ${userLabel(entry)}'s message from the Alexandria archive`}
-                    >
-                      Remove message
-                    </button>
                   </div>
                   <Show when={entry.content}>
                     <p class="alexandria-content">{entry.content}</p>
@@ -1334,6 +1388,16 @@ function ArchiveModal(props) {
                       </For>
                     </div>
                   </Show>
+                  <div class="alexandria-entry-actions">
+                    <button
+                      class="alexandria-remove-entry"
+                      type="button"
+                      onClick={() => removeArchiveEntry(entry.id)}
+                      aria-label={`Remove ${userLabel(entry)}'s message from the Alexandria archive`}
+                    >
+                      Remove from archive
+                    </button>
+                  </div>
                 </article>
               )}
             </For>
