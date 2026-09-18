@@ -68,8 +68,60 @@
 .alexandria-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 8px;
+}
+
+.alexandria-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.alexandria-picker-input {
+  width: 170px;
+  min-height: 32px;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--background-modifier-accent, rgb(255 255 255 / 12%));
+  border-radius: 5px;
+  outline: 0;
+  color: var(--text-normal, #dbdee1);
+  background: var(--background-secondary, #2b2d31);
+  font: inherit;
+  font-size: 12px;
+}
+
+.alexandria-picker-input::placeholder {
+  color: var(--text-muted, #949ba4);
+}
+
+.alexandria-picker-input:focus {
+  border-color: var(--brand-experiment, #5865f2);
+  box-shadow: 0 0 0 2px rgb(88 101 242 / 20%);
+}
+
+.alexandria-picker-clear {
+  position: absolute;
+  right: 6px;
+  display: grid;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  color: var(--text-muted, #949ba4);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.alexandria-picker-clear:hover {
+  color: var(--text-normal, #dbdee1);
+  background: rgb(255 255 255 / 10%);
 }
 
 .alexandria-summary {
@@ -230,5 +282,10 @@
     align-items: flex-start;
     flex-direction: column;
     gap: 2px;
+  }
+
+  .alexandria-picker,
+  .alexandria-picker-input {
+    width: 100%;
   }
 }

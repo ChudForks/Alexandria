@@ -30,6 +30,8 @@ store[ARCHIVE_KEY] ??= [];
 store.captureEnabled ??= true;
 store.showButton ??= true;
 store.sortMode ??= "deletedAt";
+store.serverFilter ??= "";
+store.userFilter ??= "";
 
 let launcherHost;
 let removeModal;
@@ -289,6 +291,59 @@ function serverLabel(entry) {
   return entry.guildName || (entry.guildId ? `Server ${entry.guildId}` : "Direct messages");
 }
 
+function serverKey(entry) {
+  return entry.guildId || "@direct-messages";
+}
+
+function userKey(entry) {
+  return entry.authorId || `@${entry.username || entry.author}`;
+}
+
+function userLabel(entry) {
+  return entry.username && entry.username !== entry.author ? `${entry.author} (@${entry.username})` : entry.author;
+}
+
+function SearchablePicker(props) {
+  const selectedLabel = () => props.options().find((option) => option.value === props.value)?.label || "";
+  const [inputValue, setInputValue] = createSignal(selectedLabel());
+
+  function updateInput(value) {
+    setInputValue(value);
+    const match = props.options().find(
+      (option) => option.label.localeCompare(value.trim(), undefined, { sensitivity: "accent" }) === 0,
+    );
+
+    if (match) props.onChange(match.value);
+    if (!value.trim()) props.onChange("");
+  }
+
+  function clear() {
+    setInputValue("");
+    props.onChange("");
+  }
+
+  return (
+    <div class="alexandria-picker">
+      <input
+        class="alexandria-picker-input"
+        value={inputValue()}
+        list={`${props.id}-options`}
+        placeholder={props.placeholder}
+        aria-label={props.ariaLabel}
+        onInput={(event) => updateInput(event.currentTarget.value)}
+      />
+      <datalist id={`${props.id}-options`}>
+        <For each={props.options()}>{(option) => <option value={option.label} />}</For>
+      </datalist>
+      <Show when={props.value}>
+        <button class="alexandria-picker-clear" type="button" onClick={clear} aria-label={`Clear ${props.placeholder}`}>
+          ×
+        </button>
+      </Show>
+    </div>
+  );
+}
+
 function archiveCount() {
   return entries().filter((entry) => entry.deleted).length;
 }
@@ -301,12 +356,42 @@ function ArchiveModal(props) {
   const [query, setQuery] = createSignal("");
   const [showAll, setShowAll] = createSignal(false);
   const [sortMode, setSortMode] = createSignal(store.sortMode || "deletedAt");
+  const [selectedServer, setSelectedServer] = createSignal(store.serverFilter || "");
+  const [selectedUser, setSelectedUser] = createSignal(store.userFilter || "");
+
+  const serverOptions = () => {
+    const options = new Map();
+
+    entries().forEach((entry) => {
+      const key = serverKey(entry);
+      if (!options.has(key)) options.set(key, serverLabel(entry));
+    });
+
+    return [...options.entries()]
+      .map(([value, label]) => ({ value, label }))
+      .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+  };
+
+  const userOptions = () => {
+    const options = new Map();
+
+    entries().forEach((entry) => {
+      const key = userKey(entry);
+      if (!options.has(key)) options.set(key, userLabel(entry));
+    });
+
+    return [...options.entries()]
+      .map(([value, label]) => ({ value, label }))
+      .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+  };
 
   const visibleEntries = () => {
     const search = query().trim().toLowerCase();
 
     return entries()
       .filter((entry) => showAll() || entry.deleted)
+      .filter((entry) => !selectedServer() || serverKey(entry) === selectedServer())
+      .filter((entry) => !selectedUser() || userKey(entry) === selectedUser())
       .filter((entry) => {
         if (!search) return true;
         return `${entry.author} ${entry.username} ${entry.content} ${entry.channelId}`
@@ -353,6 +438,30 @@ function ArchiveModal(props) {
           >
             {showAll() ? "Deleted only" : "Show all captured"}
           </Button>
+          <SearchablePicker
+            id="alexandria-server-filter"
+            value={selectedServer()}
+            options={serverOptions}
+            placeholder="Search servers"
+            ariaLabel="Filter Alexandria archive by server"
+            onChange={(value) => {
+              const server = String(value);
+              setSelectedServer(server);
+              store.serverFilter = server;
+            }}
+          />
+          <SearchablePicker
+            id="alexandria-user-filter"
+            value={selectedUser()}
+            options={userOptions}
+            placeholder="Search users"
+            ariaLabel="Filter Alexandria archive by user"
+            onChange={(value) => {
+              const user = String(value);
+              setSelectedUser(user);
+              store.userFilter = user;
+            }}
+          />
           <Select
             value={sortMode()}
             aria-label="Sort Alexandria archive"
@@ -364,13 +473,17 @@ function ArchiveModal(props) {
           >
             <SelectOption value="deletedAt">Sort by deletion date</SelectOption>
             <SelectOption value="user">Sort by user</SelectOption>
-            <SelectOption value="server">Sort by server</SelectOption>
+            <SelectOption value="server">Sort by server name</SelectOption>
           </Select>
         </div>
 
         <div class="alexandria-summary">
           <span>{capturedCount()} message{capturedCount() === 1 ? "" : "s"} captured</span>
-          <span>{showAll() ? "Showing all saved messages" : "Showing deleted messages only"}</span>
+          <span>
+            {showAll() ? "Showing all saved messages" : "Showing deleted messages only"}
+            {selectedServer() && ` · ${serverOptions().find((server) => server.value === selectedServer())?.label || "Selected server"}`}
+            {selectedUser() && ` · ${userOptions().find((user) => user.value === selectedUser())?.label || "Selected user"}`}
+          </span>
         </div>
 
         <Show
