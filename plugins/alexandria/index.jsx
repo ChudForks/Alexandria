@@ -49,6 +49,7 @@ store.photoBackfillEnabled ??= false;
 
 let launcherHost;
 let removeModal;
+let removePhotoModal;
 const photoCapturesInFlight = new Set();
 const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
@@ -60,6 +61,45 @@ const fluxDispatcher = shelter.flux?.dispatcher;
 
 function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
+}
+
+async function photoBlobForClipboard(dataUrl) {
+  const blob = await fetch(dataUrl).then((response) => response.blob());
+
+  // Chromium reliably accepts PNG clipboard images, so convert unsupported
+  // stored formats before the second clipboard attempt.
+  if (blob.type === "image/png") return blob;
+
+  const image = new Image();
+  image.src = dataUrl;
+  await image.decode();
+
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  canvas.getContext("2d").drawImage(image, 0, 0);
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (png) => (png ? resolve(png) : reject(new Error("Could not prepare the photo for copying."))),
+      "image/png",
+    );
+  });
+}
+
+async function copyPhoto(dataUrl) {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+    throw new Error("Image copying is not available in this Discord client.");
+  }
+
+  const original = await fetch(dataUrl).then((response) => response.blob());
+
+  try {
+    await navigator.clipboard.write([new ClipboardItem({ [original.type]: original })]);
+  } catch {
+    const png = await photoBlobForClipboard(dataUrl);
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+  }
 }
 
 function imageTypeFromFilename(filename) {
@@ -1091,6 +1131,63 @@ function CaptureScopeSettings() {
   );
 }
 
+function PhotoModal(props) {
+  const [copyState, setCopyState] = createSignal("idle");
+
+  const handleCopy = async () => {
+    setCopyState("copying");
+
+    try {
+      await copyPhoto(props.attachment.dataUrl);
+      setCopyState("copied");
+    } catch (error) {
+      console.error("[Alexandria] Could not copy archived photo", error);
+      setCopyState("error");
+    }
+  };
+
+  return (
+    <ModalRoot size={ModalSizes.LARGE} class="alexandria-modal alexandria-photo-modal">
+      <ModalHeader close={props.close}>
+        <div class="alexandria-photo-modal-title">
+          <strong>{props.attachment.filename || "Archived photo"}</strong>
+          <small>Saved locally by Alexandria</small>
+        </div>
+      </ModalHeader>
+      <ModalBody>
+        <div class="alexandria-photo-preview">
+          <img src={props.attachment.dataUrl} alt={props.attachment.filename || "Archived photo"} />
+        </div>
+        <div class="alexandria-copy-status" role="status" aria-live="polite">
+          <Show when={copyState() === "copied"}>Photo copied to your clipboard.</Show>
+          <Show when={copyState() === "error"}>Couldn’t copy the photo in this Discord client.</Show>
+        </div>
+      </ModalBody>
+      <ModalFooter>
+        <Button
+          size={ButtonSizes.MIN}
+          color={ButtonColors.SECONDARY}
+          onClick={props.close}
+        >
+          Close
+        </Button>
+        <Button
+          size={ButtonSizes.MIN}
+          onClick={handleCopy}
+          disabled={copyState() === "copying"}
+        >
+          {copyState() === "copying" ? "Copying…" : copyState() === "copied" ? "Copied!" : "Copy image"}
+        </Button>
+      </ModalFooter>
+    </ModalRoot>
+  );
+}
+
+function openPhoto(attachment) {
+  removePhotoModal?.();
+  removePhotoModal = openModal((props) => <PhotoModal {...props} attachment={attachment} />);
+}
+
 function ArchiveModal(props) {
   const [query, setQuery] = createSignal("");
   const [showAll, setShowAll] = createSignal(false);
@@ -1373,15 +1470,16 @@ function ArchiveModal(props) {
                                 </div>
                               }
                             >
-                              <a
+                              <button
                                 class="alexandria-photo"
-                                href={attachment.dataUrl}
-                                target="_blank"
-                                rel="noreferrer"
+                                type="button"
+                                onClick={() => openPhoto(attachment)}
+                                aria-label={`Enlarge and copy ${attachment.filename || "archived photo"}`}
                                 title={attachment.filename}
                               >
                                 <img src={attachment.dataUrl} alt={attachment.filename} />
-                              </a>
+                                <span class="alexandria-photo-hint" aria-hidden="true">Enlarge</span>
+                              </button>
                             </Show>
                           </Show>
                         )}

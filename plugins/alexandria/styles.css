@@ -136,10 +136,20 @@
 .alexandria-content { margin: 13px 0 0 44px; color: var(--alex-ink); font-size: 15px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .alexandria-extra { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 8px; margin: 11px 0 0 44px; color: var(--alex-muted); font-size: 13px; }
 .alexandria-extra-item { grid-column: 1 / -1; padding: 8px 10px; border-left: 3px solid var(--alex-accent); border-radius: 6px; background: var(--background-primary, #313338); line-height: 1.45; }
-.alexandria-photo { display: block; min-width: 0; overflow: hidden; border: 1px solid var(--alex-border); border-radius: 9px; background: var(--background-tertiary, #1e1f22); }
+.alexandria-photo { position: relative; display: block; width: 100%; min-width: 0; padding: 0; overflow: hidden; border: 1px solid var(--alex-border); border-radius: 9px; background: var(--background-tertiary, #1e1f22); cursor: zoom-in; }
 .alexandria-photo img { display: block; width: 100%; height: 132px; object-fit: cover; transition: transform 180ms ease; }
 .alexandria-photo:hover img { transform: scale(1.025); }
+.alexandria-photo:focus-visible { outline: 3px solid var(--alex-accent); outline-offset: 2px; }
+.alexandria-photo-hint { position: absolute; right: 8px; bottom: 8px; padding: 4px 7px; border-radius: 6px; color: #fff; background: rgb(0 0 0 / 72%); font-size: 11px; font-weight: 700; opacity: 0; transform: translateY(3px); transition: opacity 140ms ease, transform 140ms ease; }
+.alexandria-photo:hover .alexandria-photo-hint, .alexandria-photo:focus-visible .alexandria-photo-hint { opacity: 1; transform: translateY(0); }
 .alexandria-photo-status { color: var(--alex-muted); font-style: italic; }
+.alexandria-photo-modal { width: min(1040px, 94vw); }
+.alexandria-photo-modal-title { display: grid; min-width: 0; line-height: 1.2; }
+.alexandria-photo-modal-title strong { overflow: hidden; color: var(--header-primary, #fff); font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.alexandria-photo-modal-title small { margin-top: 3px; color: var(--alex-muted); font-size: 12px; }
+.alexandria-photo-preview { display: grid; min-height: 240px; max-height: 72vh; place-items: center; overflow: auto; border-radius: 10px; background: repeating-conic-gradient(rgb(255 255 255 / 3%) 0 25%, transparent 0 50%) 50% / 20px 20px, var(--background-tertiary, #1e1f22); }
+.alexandria-photo-preview img { display: block; max-width: 100%; max-height: 72vh; object-fit: contain; }
+.alexandria-copy-status { min-height: 20px; margin-top: 8px; color: var(--alex-muted); font-size: 13px; text-align: center; }
 .alexandria-entry-actions { display: flex; justify-content: flex-end; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--alex-border); opacity: 0; transition: opacity 140ms ease; }
 .alexandria-entry:hover .alexandria-entry-actions, .alexandria-entry:focus-within .alexandria-entry-actions { opacity: 1; }
 .alexandria-remove-entry { padding: 5px 8px; border: 0; border-radius: 6px; color: var(--alex-muted); background: transparent; cursor: pointer; font: inherit; font-size: 12px; font-weight: 650; }
@@ -204,5 +214,5 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .alexandria-launcher, .alexandria-entry, .alexandria-photo img { transition: none; }
+  .alexandria-launcher, .alexandria-entry, .alexandria-photo img, .alexandria-photo-hint { transition: none; }
 }
