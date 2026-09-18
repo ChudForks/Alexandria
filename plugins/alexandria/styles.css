@@ -360,6 +360,87 @@
   margin-top: 16px;
 }
 
+.alexandria-scope {
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 8px;
+  background: var(--background-secondary, #2b2d31);
+}
+
+.alexandria-settings-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--header-primary, #fff);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.alexandria-settings-note {
+  margin: 8px 0 0;
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.alexandria-scope-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.alexandria-scope-list {
+  min-width: 0;
+  max-height: 210px;
+  margin: 0;
+  padding: 8px;
+  overflow-y: auto;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 6px;
+}
+
+.alexandria-scope-list legend {
+  padding: 0 4px;
+  color: var(--header-secondary, #b5bac1);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.alexandria-scope-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: 4px;
+  color: var(--text-normal, #dbdee1);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.alexandria-scope-choice:hover {
+  background: rgb(255 255 255 / 6%);
+}
+
+.alexandria-scope-choice input {
+  accent-color: var(--brand-experiment, #5865f2);
+}
+
+.alexandria-scope-choice span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alexandria-scope-empty {
+  display: block;
+  padding: 6px 4px;
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+}
+
 .alexandria-storage {
   margin-top: 16px;
   padding: 12px;
@@ -404,5 +485,9 @@
   .alexandria-picker,
   .alexandria-picker-input {
     width: 100%;
+  }
+
+  .alexandria-scope-columns {
+    grid-template-columns: 1fr;
   }
 }

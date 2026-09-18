@@ -10,6 +10,12 @@ sent-message responses. It cannot recover messages from before the plugin was
 enabled. The archive is stored in Shelter's persistent plugin storage and is
 cleared only when you explicitly use **Clear archive**.
 
+The recording scope can be set to every conversation or a chosen set of servers
+and direct messages. The independent **Active mode** switch additionally records
+the server or DM currently open in Discord, even when it is not selected, while
+the configured servers and DMs continue recording.
+The global **Capture messages** switch remains authoritative in every mode.
+
 ## Getting started
 You should be using [pnpm](https://pnpm.io/) with this template ideally.
 

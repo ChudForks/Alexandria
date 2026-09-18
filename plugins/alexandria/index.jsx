@@ -29,6 +29,17 @@ const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 
 store[ARCHIVE_KEY] ??= [];
 store.captureEnabled ??= true;
+store.captureMode ??= "all";
+store.selectedGuildIds ??= [];
+store.selectedDirectMessageIds ??= [];
+store.activeMode ??= store.captureMode === "active";
+if (store.captureMode === "active") {
+  store.captureMode =
+    (Array.isArray(store.selectedGuildIds) && store.selectedGuildIds.length) ||
+    (Array.isArray(store.selectedDirectMessageIds) && store.selectedDirectMessageIds.length)
+      ? "selected"
+      : "all";
+}
 store.showButton ??= true;
 store.sortMode ??= "deletedAt";
 store.serverFilter ??= "";
@@ -111,6 +122,66 @@ function directMessageName(channel) {
 
 function channelName(channel) {
   return asString(channel?.name || channel?.topic);
+}
+
+function storedIdList(key) {
+  return Array.isArray(store[key]) ? store[key].map(asString).filter(Boolean) : [];
+}
+
+function messageLocation(message, fallbackChannelId = "") {
+  const channelId = asString(message?.channel_id || message?.channelId || fallbackChannelId);
+  const channel = fluxStores.ChannelStore?.getChannel?.(channelId);
+  const guildId = asString(
+    message?.guild_id || message?.guildId || message?.guild?.id || channel?.guild_id || channel?.guildId,
+  );
+
+  return { channelId, guildId };
+}
+
+function selectedChannelId() {
+  const selectedChannelStore = fluxStores.SelectedChannelStore;
+  const routeChannelId = globalThis.location?.pathname?.match?.(/\/channels\/(?:@me|\d+)\/(\d+)/)?.[1];
+  return asString(
+    routeChannelId ||
+      selectedChannelStore?.getChannelId?.() ||
+      selectedChannelStore?.getCurrentlySelectedChannelId?.() ||
+      "",
+  );
+}
+
+function shouldCaptureMessage(message, fallbackChannelId = "") {
+  // Capture disabled is always authoritative. Active can add the current
+  // server/DM to the saved scope, but never bypasses this global switch.
+  if (store.captureEnabled === false) return false;
+
+  const { channelId, guildId } = messageLocation(message, fallbackChannelId);
+  if (!channelId) return false;
+
+  if (store.activeMode === true) {
+    const activeChannelId = selectedChannelId();
+    if (activeChannelId) {
+      const route = globalThis.location?.pathname?.match?.(/\/channels\/(@me|\d+)\/(\d+)/);
+      if (route?.[1] && route[1] !== "@me" && guildId === route[1]) return true;
+      if (route?.[1] === "@me" && channelId === route[2]) return true;
+
+      const activeChannel = fluxStores.ChannelStore?.getChannel?.(activeChannelId);
+      const activeGuildId = asString(activeChannel?.guild_id || activeChannel?.guildId);
+      // Active is additive: it admits the current server/DM, then the normal
+      // All/Selected scope below continues to admit its configured sources.
+      if (activeGuildId ? guildId === activeGuildId : channelId === activeChannelId) return true;
+    }
+  }
+
+  const mode = asString(store.captureMode, "all");
+  if (mode === "all") return true;
+
+  if (mode === "selected") {
+    return guildId
+      ? storedIdList("selectedGuildIds").includes(guildId)
+      : storedIdList("selectedDirectMessageIds").includes(channelId);
+  }
+
+  return true;
 }
 
 function toArchiveEntry(message) {
@@ -279,10 +350,10 @@ function backfillArchivedPhotos() {
 }
 
 function saveMessage(message) {
-  if (store.captureEnabled === false) return;
+  if (!shouldCaptureMessage(message)) return false;
 
   const incoming = toArchiveEntry(message);
-  if (!incoming) return;
+  if (!incoming) return false;
 
   const current = entries();
   const index = current.findIndex((entry) => entry.id === incoming.id);
@@ -290,7 +361,7 @@ function saveMessage(message) {
   if (index === -1) {
     store[ARCHIVE_KEY] = [...current, { ...incoming, deleted: false, deletedAt: null }];
     cachePhotos(incoming.id, incoming.attachments);
-    return;
+    return true;
   }
 
   const previous = current[index];
@@ -312,13 +383,14 @@ function saveMessage(message) {
 
   if (sameJSON(previous, updated)) {
     cachePhotos(incoming.id, updated.attachments);
-    return;
+    return true;
   }
 
   const next = [...current];
   next[index] = updated;
   store[ARCHIVE_KEY] = next;
   cachePhotos(incoming.id, updated.attachments);
+  return true;
 }
 
 function messageFromStore(id, channelId) {
@@ -438,6 +510,13 @@ function handleDispatch(payload) {
   if (!payload?.type) return;
   if (store.captureEnabled === false) return;
 
+  if (payload.type === "CHANNEL_SELECT" || payload.type === "GUILD_SELECT") {
+    // Let Discord update its selected-channel store and render the new view,
+    // then index already-loaded messages when Active mode is in use.
+    if (store.activeMode === true) setTimeout(captureLoadedMessages, 0);
+    return;
+  }
+
   // Allow Alexandria's explicit cleanup action through to Discord's store.
   // Without this marker, the normal delete interceptor would retain it again.
   if (
@@ -455,6 +534,7 @@ function handleDispatch(payload) {
     const channelId =
       payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId;
     const snapshot = messageFromStore(asString(messageId), asString(channelId)) || payload.message;
+    if (!shouldCaptureMessage(snapshot, channelId)) return;
 
     try {
       markDeleted(messageId, channelId);
@@ -475,6 +555,7 @@ function handleDispatch(payload) {
   if (payload.type === "MESSAGE_DELETE_BULK") {
     const ids = payload.ids || payload.messageIds || payload.messages;
     const channelId = payload.channel_id || payload.channelId;
+    if (!shouldCaptureMessage(null, channelId)) return;
     const snapshots = Array.isArray(ids)
       ? ids.map((id) => {
           const messageId = id?.id || id;
@@ -571,7 +652,7 @@ function captureRenderedMessage(element) {
   // Do not mark the element until its fiber has yielded a message. React can
   // briefly render the element before the message props are attached.
   if (!message) return;
-  saveMessage(message);
+  if (!saveMessage(message)) return;
   element.dataset.alexandriaCaptured = "1";
 
   const archived = entries().find((entry) => entry.id === asString(message.id));
@@ -789,6 +870,216 @@ function formatBytes(bytes) {
   const precision = unitIndex === 0 || value >= 10 ? 0 : 1;
 
   return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function guildChoices() {
+  const choices = new Map();
+  const guilds = fluxStores.GuildStore?.getGuilds?.() || {};
+
+  Object.values(guilds).forEach((guild) => {
+    const id = asString(guild?.id);
+    if (id) choices.set(id, asString(guild?.name, `Server ${id}`));
+  });
+  entries().forEach((entry) => {
+    if (entry.guildId && !choices.has(entry.guildId)) choices.set(entry.guildId, serverLabel(entry));
+  });
+
+  return [...choices.entries()]
+    .map(([value, label]) => ({ value, label }))
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+}
+
+function directMessageChoices() {
+  const choices = new Map();
+  const privateChannelStore = fluxStores.PrivateChannelStore;
+  const privateChannelSortStore = fluxStores.PrivateChannelSortStore;
+  const channelStore = fluxStores.ChannelStore;
+  const addChannel = (candidate, depth = 0) => {
+    if (!candidate || depth > 3) return;
+
+    if (typeof candidate === "string" || typeof candidate === "number") {
+      addChannel(channelStore?.getChannel?.(asString(candidate)), depth + 1);
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach((item) => addChannel(item, depth + 1));
+      return;
+    }
+    if (candidate instanceof Map || candidate instanceof Set) {
+      candidate.forEach((item) => addChannel(item, depth + 1));
+      return;
+    }
+
+    const id = asString(candidate?.id);
+    if (id) {
+      // Sources below are private-channel stores, but retain this guard in
+      // case Discord changes one of them to return a mixed channel map.
+      if (!asString(candidate?.guild_id || candidate?.guildId)) {
+        choices.set(id, directMessageName(candidate) || asString(candidate?.name, `Direct message ${id}`));
+      }
+      return;
+    }
+
+    if (typeof candidate === "object") {
+      Object.values(candidate).forEach((item) => addChannel(item, depth + 1));
+    }
+  };
+  const sources = [
+    privateChannelStore?.getPrivateChannels?.(),
+    privateChannelStore?.getPrivateChannelIds?.(),
+    privateChannelStore?.getSortedPrivateChannels?.(),
+    channelStore?.getPrivateChannels?.(),
+    channelStore?.getMutablePrivateChannels?.(),
+    channelStore?.getSortedPrivateChannels?.(),
+    privateChannelSortStore?.getPrivateChannelIds?.(),
+    privateChannelSortStore?.getSortedPrivateChannels?.(),
+  ];
+
+  sources.forEach((source) => addChannel(source));
+
+  // Some Discord builds expose DMs only through relationship-to-channel
+  // lookups rather than a complete private-channel collection.
+  const relationships = fluxStores.RelationshipStore?.getRelationships?.() || {};
+  const relationshipUserIds = relationships instanceof Map
+    ? [...relationships.keys()]
+    : Object.keys(relationships);
+  relationshipUserIds.forEach((userId) => {
+    const dm =
+      channelStore?.getDMFromUserId?.(userId) ||
+      privateChannelStore?.getDMFromUserId?.(userId);
+    addChannel(dm);
+  });
+
+  const currentChannel = channelStore?.getChannel?.(selectedChannelId());
+  if (currentChannel && !asString(currentChannel.guild_id || currentChannel.guildId)) addChannel(currentChannel);
+
+  entries().forEach((entry) => {
+    if (!entry.guildId && entry.channelId && !choices.has(entry.channelId)) {
+      choices.set(entry.channelId, directMessageLabel(entry));
+    }
+  });
+
+  return [...choices.entries()]
+    .map(([value, label]) => ({ value, label }))
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+}
+
+function activeScopeLabel() {
+  const channelId = selectedChannelId();
+  const channel = fluxStores.ChannelStore?.getChannel?.(channelId);
+  const guildId = asString(channel?.guild_id || channel?.guildId);
+
+  if (guildId) {
+    const guild = fluxStores.GuildStore?.getGuild?.(guildId);
+    return asString(guild?.name, `Server ${guildId}`);
+  }
+  return directMessageName(channel) || (channelId ? `Direct message ${channelId}` : "No conversation selected");
+}
+
+function CaptureScopeSettings() {
+  const [mode, setMode] = createSignal(asString(store.captureMode, "all"));
+  const [activeMode, setActiveMode] = createSignal(store.activeMode === true);
+  const [guildIds, setGuildIds] = createSignal(storedIdList("selectedGuildIds"));
+  const [directMessageIds, setDirectMessageIds] = createSignal(storedIdList("selectedDirectMessageIds"));
+
+  const setCaptureMode = (value) => {
+    const nextMode = asString(value, "all");
+    setMode(nextMode);
+    store.captureMode = nextMode;
+    if (store.captureEnabled !== false) setTimeout(captureLoadedMessages, 0);
+  };
+
+  const toggleChoice = (key, value, checked, setter) => {
+    const current = storedIdList(key);
+    const next = checked
+      ? [...new Set([...current, value])]
+      : current.filter((id) => id !== value);
+    store[key] = next;
+    setter(next);
+    if (checked && mode() === "selected" && store.captureEnabled !== false) {
+      setTimeout(captureLoadedMessages, 0);
+    }
+  };
+
+  return (
+    <section class="alexandria-scope">
+      <SwitchItem
+        checked={activeMode()}
+        onChange={(value) => {
+          const enabled = Boolean(value);
+          setActiveMode(enabled);
+          store.activeMode = enabled;
+          if (enabled && store.captureEnabled !== false) setTimeout(captureLoadedMessages, 0);
+        }}
+        note={`Also record the server or DM currently open (${activeScopeLabel()}), even when it is not selected below. Existing selections keep recording, and the global Capture messages switch remains authoritative.`}
+      >
+        Active mode
+      </SwitchItem>
+      <label class="alexandria-settings-label" for="alexandria-capture-mode">Recording scope</label>
+      <Select
+        id="alexandria-capture-mode"
+        value={mode()}
+        aria-label="Choose which conversations Alexandria records"
+        onChange={setCaptureMode}
+      >
+        <SelectOption value="all">All servers and direct messages</SelectOption>
+        <SelectOption value="selected">Selected servers and direct messages</SelectOption>
+      </Select>
+      <p class="alexandria-settings-note">
+        {mode() === "selected"
+          ? "Messages from the checked servers and direct messages are recorded. Active mode can add the currently open conversation."
+          : "Messages Alexandria sees in every server and direct message are recorded."}
+      </p>
+
+      <Show when={mode() === "selected"}>
+        <div class="alexandria-scope-columns">
+          <fieldset class="alexandria-scope-list">
+            <legend>Servers</legend>
+            <Show when={guildChoices().length} fallback={<span class="alexandria-scope-empty">No servers found</span>}>
+              <For each={guildChoices()}>
+                {(choice) => (
+                  <label class="alexandria-scope-choice">
+                    <input
+                      type="checkbox"
+                      checked={guildIds().includes(choice.value)}
+                      onChange={(event) =>
+                        toggleChoice("selectedGuildIds", choice.value, event.currentTarget.checked, setGuildIds)
+                      }
+                    />
+                    <span>{choice.label}</span>
+                  </label>
+                )}
+              </For>
+            </Show>
+          </fieldset>
+          <fieldset class="alexandria-scope-list">
+            <legend>Direct messages</legend>
+            <Show when={directMessageChoices().length} fallback={<span class="alexandria-scope-empty">No direct messages found</span>}>
+              <For each={directMessageChoices()}>
+                {(choice) => (
+                  <label class="alexandria-scope-choice">
+                    <input
+                      type="checkbox"
+                      checked={directMessageIds().includes(choice.value)}
+                      onChange={(event) =>
+                        toggleChoice(
+                          "selectedDirectMessageIds",
+                          choice.value,
+                          event.currentTarget.checked,
+                          setDirectMessageIds,
+                        )
+                      }
+                    />
+                    <span>{choice.label}</span>
+                  </label>
+                )}
+              </For>
+            </Show>
+          </fieldset>
+        </div>
+      </Show>
+    </section>
+  );
 }
 
 function ArchiveModal(props) {
@@ -1150,6 +1441,7 @@ export const settings = () => (
     >
       Capture messages
     </SwitchItem>
+    <CaptureScopeSettings />
     <SwitchItem
       checked={store.showButton}
       onChange={(value) => {
