@@ -12,11 +12,11 @@
   gap: 8px;
   min-height: 36px;
   padding: 0 13px;
-  border: 0;
+  border: 1px solid rgb(255 255 255 / 14%);
   border-radius: 18px;
   color: #fff;
-  background: var(--brand-experiment, #5865f2);
-  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+  background: linear-gradient(135deg, var(--brand-experiment, #5865f2), #7c5cff);
+  box-shadow: 0 10px 28px rgb(0 0 0 / 32%), inset 0 1px 0 rgb(255 255 255 / 16%);
   cursor: pointer;
   font: inherit;
   font-size: 13px;
@@ -36,8 +36,9 @@
 }
 
 .alexandria-launcher-icon {
-  font-size: 16px;
-  line-height: 1;
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
 }
 
 .alexandria-count {
@@ -54,18 +55,27 @@
   max-height: min(720px, 90vh);
 }
 
+.alexandria-search {
+  margin: 0 0 10px;
+}
+
+.alexandria-search input {
+  min-height: 38px;
+  color: var(--text-normal, #dbdee1);
+  background: var(--background-secondary, #2b2d31);
+}
+
 .alexandria-toolbar {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 10px;
-}
-
-.alexandria-toolbar > :first-child {
-  flex: 1;
+  margin-bottom: 8px;
 }
 
 .alexandria-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 12px;
   color: var(--text-muted, #949ba4);
   font-size: 12px;
@@ -81,10 +91,18 @@
 }
 
 .alexandria-entry {
-  padding: 11px 12px;
+  padding: 12px;
+  border: 1px solid rgb(255 255 255 / 5%);
   border-left: 3px solid var(--text-muted, #949ba4);
-  border-radius: 4px;
+  border-radius: 8px;
   background: var(--background-secondary, #2b2d31);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.alexandria-entry:hover {
+  border-color: rgb(255 255 255 / 12%);
+  border-left-color: var(--brand-experiment, #5865f2);
+  background: var(--background-secondary-alt, #232428);
 }
 
 .alexandria-entry.is-deleted {
@@ -99,13 +117,46 @@
   gap: 8px;
 }
 
+.alexandria-identity {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.alexandria-avatar {
+  display: grid;
+  flex: 0 0 26px;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--header-primary, #fff);
+  background: var(--background-tertiary, #1e1f22);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .alexandria-author {
+  display: block;
   color: var(--header-primary, #fff);
   font-size: 14px;
   font-weight: 650;
 }
 
+.alexandria-username {
+  display: block;
+  margin-top: 1px;
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+}
+
 .alexandria-status {
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: rgb(237 66 69 / 14%);
   color: var(--status-danger, #ed4245);
   font-size: 11px;
   font-weight: 650;
@@ -114,18 +165,21 @@
 
 .is-captured .alexandria-status {
   color: var(--text-muted, #949ba4);
+  background: rgb(148 155 164 / 12%);
 }
 
 .alexandria-meta {
+  flex-wrap: wrap;
   justify-content: flex-start;
   margin-top: 3px;
   color: var(--text-muted, #949ba4);
   font-size: 11px;
 }
 
-.alexandria-meta > * + *::before {
-  margin-right: 8px;
-  content: "•";
+.alexandria-meta > * {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgb(0 0 0 / 12%);
 }
 
 .alexandria-content {
@@ -141,8 +195,22 @@
   font-size: 12px;
 }
 
+.alexandria-extra-item {
+  padding: 5px 7px;
+  border-left: 2px solid var(--brand-experiment, #5865f2);
+  border-radius: 3px;
+  background: rgb(0 0 0 / 10%);
+}
+
+.alexandria-extra-item + .alexandria-extra-item {
+  margin-top: 4px;
+}
+
 .alexandria-empty {
-  padding: 36px 12px;
+  padding: 42px 16px;
+  border: 1px dashed rgb(255 255 255 / 10%);
+  border-radius: 8px;
+  background: rgb(0 0 0 / 8%);
   color: var(--text-muted, #949ba4);
   text-align: center;
 }
@@ -151,4 +219,16 @@
   display: flex;
   gap: 8px;
   margin-top: 16px;
+}
+
+@media (max-width: 600px) {
+  .alexandria-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .alexandria-summary {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
 }

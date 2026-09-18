@@ -62,8 +62,12 @@ function toArchiveEntry(message) {
 
   const author = message.author || {};
   const channelId = asString(message.channel_id || message.channelId);
-  const guildId = asString(message.guild_id || message.guildId);
   const channel = fluxStores.ChannelStore?.getChannel?.(channelId);
+  // Delete and store-recovery payloads do not always include guild_id. A
+  // guild channel carries the same information, while DM channels do not.
+  const guildId = asString(
+    message.guild_id || message.guildId || message.guild?.id || channel?.guild_id || channel?.guildId,
+  );
   const guild = fluxStores.GuildStore?.getGuild?.(guildId);
   const attachments = Array.isArray(message.attachments)
     ? message.attachments.map(normaliseAttachment)
@@ -77,7 +81,9 @@ function toArchiveEntry(message) {
     id: asString(message.id),
     channelId,
     guildId,
-    guildName: asString(message.guild?.name || message.guild_name || message.guildName || guild?.name),
+    guildName: asString(
+      message.guild?.name || message.guild_name || message.guildName || guild?.name || channel?.guild?.name,
+    ),
     authorId: asString(author.id || message.author_id || message.authorId),
     author: asString(author.global_name || author.display_name || author.username, "Unknown user"),
     username: asString(author.username),
@@ -126,11 +132,47 @@ function saveMessage(message) {
   store[ARCHIVE_KEY] = next;
 }
 
-function markDeleted(id) {
+function messageFromStore(id, channelId) {
+  const messageStore = fluxStores.MessageStore;
+  if (!messageStore || !id) return null;
+
+  try {
+    // A delete action is intercepted before Discord removes the message from
+    // its store. This also covers messages that existed before Alexandria
+    // started, provided they are still loaded in the current channel.
+    const direct = channelId && messageStore.getMessage?.(channelId, id);
+    if (direct?.id) return direct;
+
+    const collection = channelId && messageStore.getMessages?.(channelId);
+    const fromCollection = collection?.get?.(id) || collection?._array?.find?.((message) => message.id === id);
+    if (fromCollection?.id) return fromCollection;
+  } catch {
+    // Discord's message-store implementation changes occasionally. The
+    // normal captured-message path remains available if this lookup fails.
+  }
+
+  return null;
+}
+
+function markDeleted(id, channelId) {
   if (!id) return;
 
-  const current = entries();
-  const index = current.findIndex((entry) => entry.id === asString(id));
+  const messageId = asString(id);
+  let current = entries();
+  let index = current.findIndex((entry) => entry.id === messageId);
+
+  // Messages sent before plugin startup do not have a MESSAGE_CREATE event for
+  // Alexandria to observe. Recover them from Discord's store while the delete
+  // action is still in flight, then archive them like any other message.
+  if (index === -1) {
+    const message = messageFromStore(messageId, asString(channelId));
+    if (message) {
+      saveMessage({ ...message, channel_id: message.channel_id || channelId });
+      current = entries();
+      index = current.findIndex((entry) => entry.id === messageId);
+    }
+  }
+
   if (index === -1 || current[index].deleted) return;
 
   const next = [...current];
@@ -163,13 +205,14 @@ function handleDispatch(payload) {
   }
 
   if (payload.type === "MESSAGE_DELETE") {
-    markDeleted(payload.id || payload.message?.id);
+    markDeleted(payload.id || payload.message?.id, payload.channel_id || payload.channelId || payload.message?.channel_id);
     return;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
     const ids = payload.ids || payload.messageIds || payload.messages;
-    if (Array.isArray(ids)) ids.forEach((id) => markDeleted(id?.id || id));
+    const channelId = payload.channel_id || payload.channelId;
+    if (Array.isArray(ids)) ids.forEach((id) => markDeleted(id?.id || id, id?.channel_id || channelId));
   }
 }
 
@@ -250,6 +293,10 @@ function archiveCount() {
   return entries().filter((entry) => entry.deleted).length;
 }
 
+function capturedCount() {
+  return entries().length;
+}
+
 function ArchiveModal(props) {
   const [query, setQuery] = createSignal("");
   const [showAll, setShowAll] = createSignal(false);
@@ -290,13 +337,15 @@ function ArchiveModal(props) {
     <ModalRoot size={ModalSizes.LARGE} class="alexandria-modal">
       <ModalHeader close={props.close}>Alexandria archive</ModalHeader>
       <ModalBody>
-        <div class="alexandria-toolbar">
+        <div class="alexandria-search">
           <TextBox
             value={query()}
-            placeholder="Search the archive"
+            placeholder="Search messages, people, or channels"
             aria-label="Search the Alexandria archive"
             onInput={setQuery}
           />
+        </div>
+        <div class="alexandria-toolbar">
           <Button
             size={ButtonSizes.MIN}
             color={ButtonColors.SECONDARY}
@@ -320,7 +369,8 @@ function ArchiveModal(props) {
         </div>
 
         <div class="alexandria-summary">
-          {archiveCount()} deleted message{archiveCount() === 1 ? "" : "s"} saved locally
+          <span>{capturedCount()} message{capturedCount() === 1 ? "" : "s"} captured</span>
+          <span>{showAll() ? "Showing all saved messages" : "Showing deleted messages only"}</span>
         </div>
 
         <Show
@@ -336,16 +386,21 @@ function ArchiveModal(props) {
               {(entry) => (
                 <article class={`alexandria-entry ${entry.deleted ? "is-deleted" : "is-captured"}`}>
                   <div class="alexandria-entry-heading">
-                    <span class="alexandria-author">{entry.author}</span>
-                    <span class="alexandria-status">{entry.deleted ? "Deleted" : "Captured"}</span>
+                    <div class="alexandria-identity">
+                      <span class="alexandria-avatar" aria-hidden="true">{asString(entry.author, "?").slice(0, 1)}</span>
+                      <div>
+                        <span class="alexandria-author">{entry.author}</span>
+                        <Show when={entry.username && entry.username !== entry.author}>
+                          <span class="alexandria-username">@{entry.username}</span>
+                        </Show>
+                      </div>
+                    </div>
+                    <span class="alexandria-status">{entry.deleted ? "Deleted" : "Saved"}</span>
                   </div>
                   <div class="alexandria-meta">
-                    <time datetime={entry.timestamp}>Sent {formatDate(entry.timestamp)}</time>
+                    <time datetime={entry.timestamp}>{formatDate(entry.timestamp)}</time>
                     <Show when={entry.deletedAt}>
-                      <time datetime={entry.deletedAt}>Deleted {formatDate(entry.deletedAt)}</time>
-                    </Show>
-                    <Show when={entry.channelId}>
-                      <span>Channel {entry.channelId}</span>
+                      <time datetime={entry.deletedAt}>Removed {formatDate(entry.deletedAt)}</time>
                     </Show>
                     <span>{serverLabel(entry)}</span>
                   </div>
@@ -356,7 +411,7 @@ function ArchiveModal(props) {
                     <div class="alexandria-extra">
                       <For each={entry.embeds}>
                         {(embed) => (
-                          <div>
+                          <div class="alexandria-extra-item">
                             <strong>{embed.title || "Embed"}</strong>
                             <Show when={embed.description}>
                               <span> — {embed.description}</span>
@@ -369,7 +424,7 @@ function ArchiveModal(props) {
                   <Show when={entry.attachments?.length}>
                     <div class="alexandria-extra">
                       <For each={entry.attachments}>
-                        {(attachment) => <div>Attachment: {attachment.filename}</div>}
+                        {(attachment) => <div class="alexandria-extra-item">↗ {attachment.filename}</div>}
                       </For>
                     </div>
                   </Show>
@@ -418,7 +473,10 @@ function mountLauncher() {
     <ReactiveRoot>
       <Show when={store.showButton}>
         <button class="alexandria-launcher" onClick={openArchive} aria-label="Open Alexandria archive">
-          <span class="alexandria-launcher-icon" aria-hidden="true">✦</span>
+          <svg class="alexandria-launcher-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4.5 5.75A2.75 2.75 0 0 1 7.25 3H11v15H7.25A2.75 2.75 0 0 0 4.5 20.75V5.75Zm15 0A2.75 2.75 0 0 0 16.75 3H13v15h3.75a2.75 2.75 0 0 1 2.75 2.75V5.75Z" />
+            <path d="M4.5 20.75c0-.76.62-1.38 1.38-1.38H11v1.63H5.88A1.38 1.38 0 0 1 4.5 19.62v1.13Zm15 0c0-.76-.62-1.38-1.38-1.38H13v1.63h5.12a1.38 1.38 0 0 0 1.38-1.38v1.13Z" />
+          </svg>
           <span>Alexandria</span>
           <Show when={archiveCount() > 0}>
             <span class="alexandria-count">{archiveCount()}</span>
