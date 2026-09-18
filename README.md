@@ -1,6 +1,14 @@
-# [Your name here]'s shelter plugins
-If you're reading this you should either change this README,
-or you should run `npx degit uwu/shelter-template shelter-plugins`!
+# Alexandria shelter plugin
+
+Alexandria keeps a permanent, local archive of messages it captures before they
+are deleted. Open the archive from the floating Alexandria launcher or the
+plugin's settings. Closing the archive hides it without removing its contents.
+
+Because Discord's delete event does not contain message text, Alexandria
+captures messages before deletion through Flux, rendered message data, and
+sent-message responses. It cannot recover messages from before the plugin was
+enabled. The archive is stored in Shelter's persistent plugin storage and is
+cleared only when you explicitly use **Clear archive**.
 
 ## Getting started
 You should be using [pnpm](https://pnpm.io/) with this template ideally.

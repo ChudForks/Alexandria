@@ -1,0 +1,154 @@
+#alexandria-launcher-host {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.alexandria-launcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 18px;
+  color: #fff;
+  background: var(--brand-experiment, #5865f2);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 28%);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  pointer-events: auto;
+  transition: transform 120ms ease, filter 120ms ease;
+}
+
+.alexandria-launcher:hover {
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}
+
+.alexandria-launcher:focus-visible {
+  outline: 2px solid var(--text-normal, #fff);
+  outline-offset: 2px;
+}
+
+.alexandria-launcher-icon {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.alexandria-count {
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 9px;
+  color: #fff;
+  background: rgb(0 0 0 / 24%);
+  font-size: 11px;
+  text-align: center;
+}
+
+.alexandria-modal {
+  max-height: min(720px, 90vh);
+}
+
+.alexandria-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.alexandria-toolbar > :first-child {
+  flex: 1;
+}
+
+.alexandria-summary {
+  margin-bottom: 12px;
+  color: var(--text-muted, #949ba4);
+  font-size: 12px;
+}
+
+.alexandria-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.alexandria-entry {
+  padding: 11px 12px;
+  border-left: 3px solid var(--text-muted, #949ba4);
+  border-radius: 4px;
+  background: var(--background-secondary, #2b2d31);
+}
+
+.alexandria-entry.is-deleted {
+  border-left-color: var(--status-danger, #ed4245);
+}
+
+.alexandria-entry-heading,
+.alexandria-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.alexandria-author {
+  color: var(--header-primary, #fff);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.alexandria-status {
+  color: var(--status-danger, #ed4245);
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.is-captured .alexandria-status {
+  color: var(--text-muted, #949ba4);
+}
+
+.alexandria-meta {
+  justify-content: flex-start;
+  margin-top: 3px;
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+}
+
+.alexandria-meta > * + *::before {
+  margin-right: 8px;
+  content: "•";
+}
+
+.alexandria-content {
+  margin: 9px 0 0;
+  color: var(--text-normal, #dbdee1);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.alexandria-extra {
+  margin-top: 8px;
+  color: var(--text-muted, #949ba4);
+  font-size: 12px;
+}
+
+.alexandria-empty {
+  padding: 36px 12px;
+  color: var(--text-muted, #949ba4);
+  text-align: center;
+}
+
+.alexandria-settings-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
