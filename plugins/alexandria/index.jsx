@@ -33,8 +33,8 @@ store.showButton ??= true;
 store.sortMode ??= "deletedAt";
 store.serverFilter ??= "";
 store.userFilter ??= "";
+store.directMessageFilter ??= "";
 store.photoBackfillEnabled ??= false;
-store.keepDeletedInSession ??= false;
 
 let launcherHost;
 let removeModal;
@@ -45,6 +45,7 @@ let activePhotoCaptures = 0;
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
+const fluxDispatcher = shelter.flux?.dispatcher;
 
 function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
@@ -90,6 +91,28 @@ function normaliseEmbed(embed) {
   };
 }
 
+function userDisplayName(user) {
+  return asString(user?.global_name || user?.display_name || user?.username || user?.name);
+}
+
+function directMessageName(channel) {
+  if (!channel) return "";
+
+  const recipients = Array.isArray(channel.recipients) ? channel.recipients : [];
+  const names = recipients
+    .map((recipient) => {
+      if (typeof recipient === "object") return userDisplayName(recipient);
+      return userDisplayName(fluxStores.UserStore?.getUser?.(asString(recipient)));
+    })
+    .filter(Boolean);
+
+  return names.join(", ") || asString(channel.name);
+}
+
+function channelName(channel) {
+  return asString(channel?.name || channel?.topic);
+}
+
 function toArchiveEntry(message) {
   if (!message || !message.id) return null;
 
@@ -117,6 +140,8 @@ function toArchiveEntry(message) {
     guildName: asString(
       message.guild?.name || message.guild_name || message.guildName || guild?.name || channel?.guild?.name,
     ),
+    directMessageName: guildId ? "" : directMessageName(channel),
+    channelName: channelName(channel),
     authorId: asString(author.id || message.author_id || message.authorId),
     author: asString(author.global_name || author.display_name || author.username, "Unknown user"),
     username: asString(author.username),
@@ -279,6 +304,8 @@ function saveMessage(message) {
       : previous.attachments,
     embeds: incoming.embeds.length ? incoming.embeds : previous.embeds,
     guildName: incoming.guildName || previous.guildName || "",
+    directMessageName: incoming.directMessageName || previous.directMessageName || "",
+    channelName: incoming.channelName || previous.channelName || "",
     deleted: previous.deleted === true,
     deletedAt: previous.deletedAt || null,
   };
@@ -316,6 +343,50 @@ function messageFromStore(id, channelId) {
   return null;
 }
 
+function messageFromRenderedDom(id, channelId) {
+  const messageId = asString(id);
+  const currentChannelId = asString(channelId);
+  const candidates = [
+    currentChannelId && document.getElementById(`chat-messages-${currentChannelId}-${messageId}`),
+    document.getElementById(`message-content-${messageId}`),
+    document.getElementById(`message-username-${messageId}`),
+  ].filter(Boolean);
+
+  for (const element of candidates) {
+    const message = messageFromRenderedElement(element);
+    if (message?.id === messageId) return message;
+  }
+
+  return null;
+}
+
+function retainMessageInStore(message, id, channelId) {
+  const messageId = asString(id || message?.id);
+  const currentChannelId = asString(channelId || message?.channel_id || message?.channelId);
+  const snapshot =
+    message ||
+    messageFromStore(messageId, currentChannelId) ||
+    messageFromRenderedDom(messageId, currentChannelId);
+  if (!snapshot?.id || !currentChannelId) return;
+
+  setTimeout(() => {
+    const retained = messageFromStore(messageId, currentChannelId);
+    if (!retained) {
+      try {
+        fluxDispatcher?.dispatch?.({
+          type: "MESSAGE_CREATE",
+          channelId: currentChannelId,
+          message: snapshot,
+          alexandriaRetained: true,
+        });
+      } catch {
+        // Blocking the original delete remains the primary retention path.
+      }
+    }
+    markDeletedMessageAfterRender(messageId, currentChannelId);
+  }, 0);
+}
+
 function markDeleted(id, channelId) {
   if (!id) return false;
 
@@ -327,7 +398,9 @@ function markDeleted(id, channelId) {
   // Alexandria to observe. Recover them from Discord's store while the delete
   // action is still in flight, then archive them like any other message.
   if (index === -1) {
-    const message = messageFromStore(messageId, asString(channelId));
+    const message =
+      messageFromStore(messageId, asString(channelId)) ||
+      messageFromRenderedDom(messageId, asString(channelId));
     if (message) {
       saveMessage({ ...message, channel_id: message.channel_id || channelId });
       current = entries();
@@ -345,6 +418,7 @@ function markDeleted(id, channelId) {
     deletedAt: new Date().toISOString(),
   };
   store[ARCHIVE_KEY] = next;
+  markDeletedMessageAfterRender(messageId, asString(channelId));
   return true;
 }
 
@@ -362,6 +436,14 @@ function messageFromPayload(payload) {
 
 function handleDispatch(payload) {
   if (!payload?.type) return;
+  if (store.captureEnabled === false) return;
+
+  // Allow Alexandria's explicit cleanup action through to Discord's store.
+  // Without this marker, the normal delete interceptor would retain it again.
+  if (
+    payload.alexandriaRemove &&
+    (payload.type === "MESSAGE_DELETE" || payload.type === "MESSAGE_DELETE_BULK")
+  ) return;
 
   if (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") {
     saveMessage(messageFromPayload(payload));
@@ -369,31 +451,53 @@ function handleDispatch(payload) {
   }
 
   if (payload.type === "MESSAGE_DELETE") {
-    const archived = markDeleted(
-      payload.id || payload.message?.id,
-      payload.channel_id || payload.channelId || payload.message?.channel_id,
-    );
+    const messageId = payload.id || payload.messageId || payload.message?.id;
+    const channelId =
+      payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId;
+    const snapshot = messageFromStore(asString(messageId), asString(channelId)) || payload.message;
+
+    try {
+      markDeleted(messageId, channelId);
+    } catch {
+      // Archive enrichment is best-effort. It must never prevent the local
+      // delete interceptor from preserving Discord's cached message.
+    }
     // Shelter lets a Flux interceptor stop a dispatch by returning false. This
     // retains the message in Discord's in-memory store until a client restart,
     // mirroring MessageLogger's session-only behavior.
-    if (store.keepDeletedInSession && archived) return false;
-    return;
+    // Retention must not depend on whether archive recovery succeeded. The
+    // server has already deleted the message; blocking this dispatch only
+    // preserves Discord's local cached copy for the current client session.
+    retainMessageInStore(snapshot, messageId, channelId);
+    return false;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
     const ids = payload.ids || payload.messageIds || payload.messages;
     const channelId = payload.channel_id || payload.channelId;
+    const snapshots = Array.isArray(ids)
+      ? ids.map((id) => {
+          const messageId = id?.id || id;
+          return {
+            id: messageId,
+            message: messageFromStore(asString(messageId), asString(id?.channel_id || id?.channelId || channelId)),
+          };
+        })
+      : [];
     if (Array.isArray(ids)) {
-      const archived = ids.map((id) => markDeleted(id?.id || id, id?.channel_id || channelId));
-      if (store.keepDeletedInSession && archived.length > 0 && archived.every(Boolean)) return false;
+      try {
+        ids.forEach((id) => markDeleted(id?.id || id, id?.channel_id || id?.channelId || channelId));
+      } catch {
+        // Keep bulk retention independent from archive enrichment too.
+      }
     }
+    snapshots.forEach(({ id, message }) => retainMessageInStore(message, id, channelId));
+    return false;
   }
 }
 
-function captureRenderedMessage(element) {
-  if (!element || element.dataset.alexandriaCaptured) return;
-  if (store.captureEnabled === false) return;
-
+function messageFromRenderedElement(element) {
+  if (!element) return null;
   try {
     const directProps = getProps(element);
     const directMessage =
@@ -401,11 +505,7 @@ function captureRenderedMessage(element) {
       directProps?.children?.props?.message ||
       directProps?.data?.message;
 
-    if (directMessage?.id) {
-      saveMessage(directMessage);
-      element.dataset.alexandriaCaptured = "1";
-      return;
-    }
+    if (directMessage?.id) return directMessage;
 
     const fiber = reactFiberWalker(getFiber(element), "message", true);
     const message =
@@ -416,12 +516,66 @@ function captureRenderedMessage(element) {
 
     // Do not mark the element until its fiber has yielded a message. React can
     // briefly render the element before the message props are attached.
-    if (!message) return;
-    saveMessage(message);
-    element.dataset.alexandriaCaptured = "1";
+    return message?.id ? message : null;
   } catch {
     // Discord's internal fiber shape can change between client updates.
+    return null;
   }
+}
+
+function markRenderedMessageDeleted(messageId, channelId) {
+  if (!messageId) return;
+
+  // Discord's rendered rows use this ID. Unlike a fiber lookup, it remains
+  // reliable after the delete dispatch has been intercepted.
+  const rows = new Set();
+  const directRow = channelId && document.getElementById(`chat-messages-${channelId}-${messageId}`);
+  if (directRow) rows.add(directRow);
+
+  const content = document.getElementById(`message-content-${messageId}`);
+  const username = document.getElementById(`message-username-${messageId}`);
+  [content, username].filter(Boolean).forEach((element) => {
+    rows.add(element.closest('[data-list-item-id], li') || element);
+  });
+
+  document
+    .querySelectorAll(`[data-list-item-id*="${messageId}"], [id*="${messageId}"]`)
+    .forEach((element) => rows.add(element.closest('[data-list-item-id], li') || element));
+
+  rows.forEach((row) => {
+    row.classList.add("alexandria-deleted-message");
+    row.dataset.alexandriaDeleted = "true";
+    if (row.querySelector(".alexandria-deleted-marker")) return;
+
+    const marker = document.createElement("span");
+    marker.className = "alexandria-deleted-marker";
+    marker.textContent = " [Deleted]";
+    marker.title = "This message was deleted and is being retained for this session.";
+    (content?.closest('[data-list-item-id], li') === row ? content : row).append(marker);
+  });
+}
+
+function markDeletedMessageAfterRender(messageId, channelId) {
+  // The retained row can be re-rendering while Discord processes the blocked
+  // delete event. Try again on the next two render turns without keeping a
+  // permanent observer alive.
+  markRenderedMessageDeleted(messageId, channelId);
+  [0, 100].forEach((delay) => setTimeout(() => markRenderedMessageDeleted(messageId, channelId), delay));
+}
+
+function captureRenderedMessage(element) {
+  if (!element || element.dataset.alexandriaCaptured) return;
+  if (store.captureEnabled === false) return;
+
+  const message = messageFromRenderedElement(element);
+  // Do not mark the element until its fiber has yielded a message. React can
+  // briefly render the element before the message props are attached.
+  if (!message) return;
+  saveMessage(message);
+  element.dataset.alexandriaCaptured = "1";
+
+  const archived = entries().find((entry) => entry.id === asString(message.id));
+  if (archived?.deleted) markDeletedMessageAfterRender(archived.id, archived.channelId);
 }
 
 function captureLoadedMessages() {
@@ -473,6 +627,99 @@ function userKey(entry) {
 
 function userLabel(entry) {
   return entry.username && entry.username !== entry.author ? `${entry.author} (@${entry.username})` : entry.author;
+}
+
+function directMessageLabel(entry) {
+  if (entry.guildId) return "";
+
+  // Resolve the current channel too, so entries captured before this field was
+  // added can still be searched by their DM recipient.
+  const channel = fluxStores.ChannelStore?.getChannel?.(entry.channelId);
+  return entry.directMessageName || directMessageName(channel) || `Direct message (${entry.channelId})`;
+}
+
+function channelLabel(entry) {
+  if (!entry.guildId) return `DM: ${directMessageLabel(entry)}`;
+
+  const currentChannel = fluxStores.ChannelStore?.getChannel?.(entry.channelId);
+  const name = entry.channelName || channelName(currentChannel);
+  return name ? `#${name} · ${serverLabel(entry)}` : `Channel ${entry.channelId} · ${serverLabel(entry)}`;
+}
+
+function removeArchiveEntry(messageId) {
+  const current = entries();
+  const entry = current.find((item) => item.id === messageId);
+
+  if (entry?.deleted) {
+    try {
+      fluxDispatcher?.dispatch?.({
+        type: "MESSAGE_DELETE",
+        channelId: entry.channelId,
+        id: entry.id,
+        alexandriaRemove: true,
+      });
+    } catch {
+      // The archive copy can still be removed if Discord's local row already
+      // disappeared or its internal store shape changed.
+    }
+  }
+
+  const next = current.filter((entry) => entry.id !== messageId);
+  if (next.length !== current.length) store[ARCHIVE_KEY] = next;
+}
+
+function removeDuplicateDomIds(element) {
+  if (element instanceof Element) element.removeAttribute("id");
+  element.querySelectorAll?.("[id]").forEach((child) => child.removeAttribute("id"));
+}
+
+function replaceMenuItemLabel(item, label) {
+  const candidates = [...item.querySelectorAll("span, div")]
+    .filter((element) => element.children.length === 0 && element.textContent.trim());
+  const textElement = candidates.find((element) => /delete message|report message/i.test(element.textContent));
+  if (textElement) textElement.textContent = label;
+  else item.textContent = label;
+}
+
+function addArchiveContextMenuItem(message) {
+  const entry = entries().find((item) => item.id === asString(message?.id));
+  // Match MessageLogger's scope: this is a cleanup action for a deleted
+  // message, not an extra item on every ordinary message's context menu.
+  if (!entry?.deleted) return;
+
+  const menus = [...document.querySelectorAll('[role="menu"]')];
+  const menu = menus.at(-1);
+  if (!menu || menu.querySelector('[data-alexandria-remove-message]')) return;
+
+  const menuItems = [...menu.querySelectorAll('[role="menuitem"]')];
+  const reference =
+    menuItems.find((item) => /delete message/i.test(item.textContent)) ||
+    menuItems.find((item) => /report message/i.test(item.textContent)) ||
+    menuItems.at(-1);
+  if (!reference?.parentElement) return;
+
+  const item = reference.cloneNode(true);
+  removeDuplicateDomIds(item);
+  replaceMenuItemLabel(item, "Remove from Alexandria archive");
+  item.dataset.alexandriaRemoveMessage = entry.id;
+  item.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    removeArchiveEntry(entry.id);
+    menu.remove();
+  });
+  reference.insertAdjacentElement("afterend", item);
+}
+
+function handleMessageContextMenu(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target) return;
+
+  const messageElement = target.closest('[id^="message-"], [data-list-item-id^="chat-messages-"]');
+  const message = messageFromRenderedElement(messageElement);
+  if (!message?.id || !entries().some((entry) => entry.id === asString(message.id) && entry.deleted)) return;
+
+  setTimeout(() => addArchiveContextMenuItem(message), 0);
 }
 
 function SearchablePicker(props) {
@@ -530,6 +777,7 @@ function ArchiveModal(props) {
   const [sortMode, setSortMode] = createSignal(store.sortMode || "deletedAt");
   const [selectedServer, setSelectedServer] = createSignal(store.serverFilter || "");
   const [selectedUser, setSelectedUser] = createSignal(store.userFilter || "");
+  const [selectedDirectMessage, setSelectedDirectMessage] = createSignal(store.directMessageFilter || "");
 
   const serverOptions = () => {
     const options = new Map();
@@ -557,6 +805,18 @@ function ArchiveModal(props) {
       .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
   };
 
+  const directMessageOptions = () => {
+    const options = new Map();
+
+    entries().filter((entry) => !entry.guildId).forEach((entry) => {
+      if (!options.has(entry.channelId)) options.set(entry.channelId, directMessageLabel(entry));
+    });
+
+    return [...options.entries()]
+      .map(([value, label]) => ({ value, label }))
+      .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
+  };
+
   const visibleEntries = () => {
     const search = query().trim().toLowerCase();
 
@@ -564,9 +824,10 @@ function ArchiveModal(props) {
       .filter((entry) => showAll() || entry.deleted)
       .filter((entry) => !selectedServer() || serverKey(entry) === selectedServer())
       .filter((entry) => !selectedUser() || userKey(entry) === selectedUser())
+      .filter((entry) => !selectedDirectMessage() || entry.channelId === selectedDirectMessage())
       .filter((entry) => {
         if (!search) return true;
-        return `${entry.author} ${entry.username} ${entry.content} ${entry.channelId}`
+        return `${entry.author} ${entry.username} ${entry.content} ${entry.channelId} ${directMessageLabel(entry)}`
           .toLowerCase()
           .includes(search);
       })
@@ -634,6 +895,18 @@ function ArchiveModal(props) {
               store.userFilter = user;
             }}
           />
+          <SearchablePicker
+            id="alexandria-direct-message-filter"
+            value={selectedDirectMessage()}
+            options={directMessageOptions}
+            placeholder="Search direct messages"
+            ariaLabel="Filter Alexandria archive by direct message"
+            onChange={(value) => {
+              const directMessage = String(value);
+              setSelectedDirectMessage(directMessage);
+              store.directMessageFilter = directMessage;
+            }}
+          />
           <Select
             value={sortMode()}
             aria-label="Sort Alexandria archive"
@@ -655,6 +928,7 @@ function ArchiveModal(props) {
             {showAll() ? "Showing all saved messages" : "Showing deleted messages only"}
             {selectedServer() && ` · ${serverOptions().find((server) => server.value === selectedServer())?.label || "Selected server"}`}
             {selectedUser() && ` · ${userOptions().find((user) => user.value === selectedUser())?.label || "Selected user"}`}
+            {selectedDirectMessage() && ` · ${directMessageOptions().find((directMessage) => directMessage.value === selectedDirectMessage())?.label || "Selected direct message"}`}
           </span>
         </div>
 
@@ -687,7 +961,17 @@ function ArchiveModal(props) {
                     <Show when={entry.deletedAt}>
                       <time datetime={entry.deletedAt}>Removed {formatDate(entry.deletedAt)}</time>
                     </Show>
-                    <span>{serverLabel(entry)}</span>
+                    <span>{channelLabel(entry)}</span>
+                  </div>
+                  <div class="alexandria-entry-actions">
+                    <button
+                      class="alexandria-remove-entry"
+                      type="button"
+                      onClick={() => removeArchiveEntry(entry.id)}
+                      aria-label={`Remove ${userLabel(entry)}'s message from the Alexandria archive`}
+                    >
+                      Remove message
+                    </button>
                   </div>
                   <Show when={entry.content}>
                     <p class="alexandria-content">{entry.content}</p>
@@ -829,6 +1113,9 @@ export function onLoad() {
   );
   scoped.onDispose(stopMessageInterceptor);
 
+  document.addEventListener("contextmenu", handleMessageContextMenu, true);
+  scoped.onDispose(() => document.removeEventListener("contextmenu", handleMessageContextMenu, true));
+
   mountLauncher();
 }
 
@@ -861,15 +1148,6 @@ export const settings = () => (
       note="Try to save local copies of photos from earlier archive entries while their Discord media is still available. Downloads run three at a time."
     >
       Backfill archived photos
-    </SwitchItem>
-    <SwitchItem
-      checked={store.keepDeletedInSession}
-      onChange={(value) => {
-        store.keepDeletedInSession = value;
-      }}
-      note="Keep messages Alexandria captures in Discord's in-memory cache until the client restarts. They remain visible in chat and may appear undeleted."
-    >
-      Keep deleted messages for this session
     </SwitchItem>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
