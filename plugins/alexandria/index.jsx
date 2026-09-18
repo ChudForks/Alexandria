@@ -666,14 +666,18 @@ function markRenderedMessageDeleted(messageId, channelId) {
   rows.forEach((row) => {
     row.classList.add("alexandria-deleted-message");
     row.dataset.alexandriaDeleted = "true";
-    if (row.querySelector(".alexandria-deleted-marker")) return;
-
-    const marker = document.createElement("span");
-    marker.className = "alexandria-deleted-marker";
-    marker.textContent = " [Deleted]";
-    marker.title = "This message was deleted and is being retained for this session.";
-    (content?.closest('[data-list-item-id], li') === row ? content : row).append(marker);
+    // Older Alexandria versions injected a badge into the message DOM. The
+    // MessageLogger-style treatment uses the row itself and needs no marker.
+    row.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
   });
+}
+
+function clearRenderedDeletedStyles() {
+  document.querySelectorAll(".alexandria-deleted-message").forEach((row) => {
+    row.classList.remove("alexandria-deleted-message");
+    delete row.dataset.alexandriaDeleted;
+  });
+  document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
 }
 
 function markDeletedMessageAfterRender(messageId, channelId) {
@@ -1559,6 +1563,11 @@ function mountLauncher() {
 scoped.ui.injectCss(styles);
 
 export function onLoad() {
+  // Remove badges left in the DOM by Alexandria versions that predate the
+  // MessageLogger-style deleted-message treatment.
+  document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
+  scoped.onDispose(clearRenderedDeletedStyles);
+
   const unobserve = scoped.observeDom(
     '[id^="message-username-"], [id^="message-content-"]',
     captureRenderedMessage,
