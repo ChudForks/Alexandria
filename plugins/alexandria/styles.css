@@ -360,6 +360,36 @@
   margin-top: 16px;
 }
 
+.alexandria-storage {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 8px;
+  background: var(--background-secondary, #2b2d31);
+}
+
+.alexandria-storage-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--header-primary, #fff);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.alexandria-storage-heading strong {
+  color: var(--text-normal, #dbdee1);
+  font-variant-numeric: tabular-nums;
+}
+
+.alexandria-storage p {
+  margin: 5px 0 0;
+  color: var(--text-muted, #949ba4);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 @media (max-width: 600px) {
   .alexandria-toolbar {
     flex-wrap: wrap;

@@ -771,6 +771,26 @@ function capturedCount() {
   return entries().length;
 }
 
+function storageBytes() {
+  try {
+    const serializedStore = JSON.stringify(store);
+    return serializedStore ? new Blob([serializedStore]).size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB"];
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** unitIndex;
+  const precision = unitIndex === 0 || value >= 10 ? 0 : 1;
+
+  return `${value.toFixed(precision)} ${units[unitIndex]}`;
+}
+
 function ArchiveModal(props) {
   const [query, setQuery] = createSignal("");
   const [showAll, setShowAll] = createSignal(false);
@@ -1149,6 +1169,13 @@ export const settings = () => (
     >
       Backfill archived photos
     </SwitchItem>
+    <div class="alexandria-storage">
+      <div class="alexandria-storage-heading">
+        <span>Storage used</span>
+        <strong>{formatBytes(storageBytes())}</strong>
+      </div>
+      <p>Approximate persistent data stored by Alexandria, including cached photos.</p>
+    </div>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
         Open archive
