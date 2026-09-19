@@ -336,6 +336,7 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
   if (imageAttachments.some((attachment) => !attachment.blobKey)) return;
 
   const objectUrls = [];
+  const attachmentPreviews = [];
   try {
     const attachments = [];
     for (const archivedAttachment of archivedAttachments) {
@@ -352,6 +353,11 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
       const thumbnail = await liveThumbnailBlob(blob, archivedAttachment.width, archivedAttachment.height);
       const objectUrl = URL.createObjectURL(thumbnail);
       objectUrls.push(objectUrl);
+      attachmentPreviews.push({
+        id: archivedAttachment.id,
+        filename: archivedAttachment.filename,
+        url: objectUrl,
+      });
       const dimensions = compactMediaDimensions(archivedAttachment.width, archivedAttachment.height);
       attachments.push({
         ...source,
@@ -392,6 +398,7 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
     (currentPreview.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
     visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - currentPreview.bytes);
     currentPreview.objectUrls = objectUrls.splice(0);
+    currentPreview.attachmentPreviews = attachmentPreviews;
     currentPreview.bytes = liveMessageBytes(compacted);
     visibleDeletedMessageBytes += currentPreview.bytes;
 
@@ -490,6 +497,7 @@ function retainDeletedMessagePreview(messageId, channelId, message) {
     channelId,
     bytes: liveMessageBytes(retainedMessage),
     objectUrls: [],
+    attachmentPreviews: [],
   };
   visibleDeletedMessages.delete(messageId);
   visibleDeletedMessages.set(messageId, preview);
@@ -1244,11 +1252,7 @@ function messageFromRenderedElement(element) {
   }
 }
 
-function markRenderedMessageDeleted(messageId, channelId) {
-  if (!messageId) return;
-
-  // Discord's rendered rows use this ID. Unlike a fiber lookup, it remains
-  // reliable after the delete dispatch has been intercepted.
+function renderedMessageRows(messageId, channelId) {
   const rows = new Set();
   const directRow = channelId && document.getElementById(`chat-messages-${channelId}-${messageId}`);
   if (directRow) rows.add(directRow);
@@ -1262,14 +1266,129 @@ function markRenderedMessageDeleted(messageId, channelId) {
   document
     .querySelectorAll(`[data-list-item-id*="${messageId}"], [id*="${messageId}"]`)
     .forEach((element) => rows.add(element.closest('[data-list-item-id], li') || element));
+  return rows;
+}
 
-  rows.forEach((row) => {
+function applyLivePhotoPreviews(messageId, channelId) {
+  const previews = visibleDeletedMessages.get(messageId)?.attachmentPreviews || [];
+  if (!previews.length) return;
+
+  renderedMessageRows(messageId, channelId).forEach((row) => {
+    const images = [...row.querySelectorAll("img")].filter((image) => {
+      const source = asString(image.currentSrc || image.src);
+      const link = asString(image.closest("a")?.href);
+      return source.includes("/attachments/") || link.includes("/attachments/") || source.startsWith("blob:");
+    });
+
+    previews.forEach((preview, index) => {
+      const image = images.find((candidate) => {
+        const source = asString(candidate.currentSrc || candidate.src);
+        const link = asString(candidate.closest("a")?.href);
+        const alt = asString(candidate.alt);
+        return (
+          (preview.id && (source.includes(preview.id) || link.includes(preview.id))) ||
+          (preview.filename && (source.includes(preview.filename) || link.includes(preview.filename) || alt === preview.filename))
+        );
+      }) || images[index];
+      if (!image) return;
+
+      image.removeAttribute("srcset");
+      image.closest("picture")?.querySelectorAll("source").forEach((source) => {
+        source.removeAttribute("srcset");
+        source.srcset = preview.url;
+      });
+      image.src = preview.url;
+      const link = image.closest("a");
+      const clickTarget = image.closest('a, [role="button"]') || image.parentElement;
+      [image, link, clickTarget].filter(Boolean).forEach((element) => {
+        element.dataset.alexandriaLivePhoto = "true";
+        element.dataset.alexandriaMessageId = messageId;
+        element.dataset.alexandriaAttachmentKey = preview.id || preview.filename;
+      });
+      if (link) link.href = preview.url;
+    });
+  });
+}
+
+function handleLivePhotoClick(event) {
+  if (event.button !== undefined && event.button !== 0) return;
+  let target = event.target instanceof Element
+    ? event.target.closest('[data-alexandria-live-photo="true"]')
+    : null;
+  const eventPath = event.composedPath?.() || [];
+  const row = (
+    event.target instanceof Element
+      ? event.target.closest(".alexandria-deleted-message")
+      : null
+  ) || eventPath.find((element) => element instanceof Element && element.matches(".alexandria-deleted-message"));
+  if (!target && row) {
+    const previewFilenames = new Set(
+      (visibleDeletedMessages.get(asString(row.dataset.alexandriaMessageId))?.attachmentPreviews || [])
+        .map((preview) => preview.filename)
+        .filter(Boolean),
+    );
+    const clickedImage = [...row.querySelectorAll("img")]
+      .filter((image) => {
+        const imageSource = asString(image.currentSrc || image.src);
+        return (
+          image.dataset.alexandriaLivePhoto === "true" ||
+          imageSource.startsWith("blob:") ||
+          imageSource.includes("/attachments/") ||
+          previewFilenames.has(asString(image.alt))
+        );
+      })
+      .find((image) => {
+        const bounds = image.getBoundingClientRect();
+        return (
+          event.clientX >= bounds.left &&
+          event.clientX <= bounds.right &&
+          event.clientY >= bounds.top &&
+          event.clientY <= bounds.bottom
+        );
+      });
+    target = clickedImage || null;
+  }
+  if (!target) return;
+
+  const messageId = asString(target.dataset.alexandriaMessageId || row?.dataset.alexandriaMessageId);
+  const previews = visibleDeletedMessages.get(messageId)?.attachmentPreviews || [];
+  const source = target instanceof HTMLImageElement ? asString(target.currentSrc || target.src) : "";
+  const matchedPreview = previews.find(
+    (preview) =>
+      preview.url === source ||
+      preview.url === target.href ||
+      (preview.id && source.includes(preview.id)) ||
+      (preview.filename && (source.includes(preview.filename) || target.alt === preview.filename)),
+  ) || (previews.length === 1 ? previews[0] : null);
+  const key = asString(
+    target.dataset.alexandriaAttachmentKey || matchedPreview?.id || matchedPreview?.filename,
+  );
+  const entry = entries().find((item) => item.id === messageId);
+  const attachment = entry?.attachments?.find(
+    (item) => attachmentKey(item) === key || item.id === key || item.filename === key,
+  );
+  if (!attachment?.blobKey) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation?.();
+  openPhoto(attachment, messageId);
+}
+
+function markRenderedMessageDeleted(messageId, channelId) {
+  if (!messageId) return;
+
+  // Discord's rendered rows use this ID. Unlike a fiber lookup, it remains
+  // reliable after the delete dispatch has been intercepted.
+  renderedMessageRows(messageId, channelId).forEach((row) => {
     row.classList.add("alexandria-deleted-message");
     row.dataset.alexandriaDeleted = "true";
+    row.dataset.alexandriaMessageId = messageId;
     // Older Alexandria versions injected a badge into the message DOM. The
     // MessageLogger-style treatment uses the row itself and needs no marker.
     row.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
   });
+  applyLivePhotoPreviews(messageId, channelId);
 }
 
 function clearRenderedDeletedStyles() {
@@ -1285,7 +1404,9 @@ function markDeletedMessageAfterRender(messageId, channelId) {
   // delete event. Try again on the next two render turns without keeping a
   // permanent observer alive.
   markRenderedMessageDeleted(messageId, channelId);
-  [0, 100].forEach((delay) => setTimeout(() => markRenderedMessageDeleted(messageId, channelId), delay));
+  [0, 100, 500, 1_500].forEach((delay) =>
+    setTimeout(() => markRenderedMessageDeleted(messageId, channelId), delay),
+  );
 }
 
 function captureRenderedMessage(element) {
@@ -2454,6 +2575,8 @@ export function onLoad() {
 
   document.addEventListener("contextmenu", handleMessageContextMenu, true);
   scoped.onDispose(() => document.removeEventListener("contextmenu", handleMessageContextMenu, true));
+  window.addEventListener("click", handleLivePhotoClick, true);
+  scoped.onDispose(() => window.removeEventListener("click", handleLivePhotoClick, true));
 
   mountLauncher();
 }

@@ -1,6 +1,6 @@
 {
   "name": "Alexandria",
-  "version": "0.8.0",
+  "version": "0.8.4",
   "author": "Chud.Dev",
   "description": "A bounded local archive for messages captured before they are deleted. Open it from the floating Alexandria button or plugin settings."
 }
