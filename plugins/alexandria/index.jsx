@@ -31,7 +31,10 @@ const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 // archive; deleted entries are retained just like ordinary captured entries.
 const MAX_ARCHIVE_ENTRIES = 2_000;
 const MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
-const MAX_PENDING_MESSAGES = 2_000;
+const MAX_PENDING_MESSAGES = 250;
+const MAX_PENDING_BYTES = 16 * 1024 * 1024;
+const MAX_VISIBLE_DELETED_MESSAGES = 100;
+const DELETED_MESSAGE_PREVIEW_MS = 30_000;
 const ARCHIVE_PAGE_SIZE = 100;
 
 store[ARCHIVE_KEY] ??= [];
@@ -66,6 +69,8 @@ const photoCaptureQueue = [];
 let activePhotoCaptures = 0;
 let archiveTrimTimer;
 const pendingMessages = new Map();
+let pendingMessageBytes = 0;
+const visibleDeletedMessages = new Map();
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
@@ -137,6 +142,38 @@ function scheduleArchiveTrim() {
     const trimmed = trimArchive(current);
     if (trimmed !== current) store[ARCHIVE_KEY] = trimmed;
   }, 250);
+}
+
+function releaseDeletedMessage(messageId, channelId) {
+  const preview = visibleDeletedMessages.get(messageId);
+  if (preview) clearTimeout(preview.timer);
+  visibleDeletedMessages.delete(messageId);
+  fluxDispatcher?.dispatch?.({
+    type: "MESSAGE_DELETE",
+    id: messageId,
+    channel_id: channelId,
+    alexandriaRemove: true,
+  });
+}
+
+function retainDeletedMessagePreview(messageId, channelId) {
+  if (!messageId || !channelId) return;
+  const previous = visibleDeletedMessages.get(messageId);
+  if (previous) clearTimeout(previous.timer);
+
+  const preview = {
+    channelId,
+    timer: setTimeout(() => releaseDeletedMessage(messageId, channelId), DELETED_MESSAGE_PREVIEW_MS),
+  };
+  visibleDeletedMessages.delete(messageId);
+  visibleDeletedMessages.set(messageId, preview);
+
+  while (visibleDeletedMessages.size > MAX_VISIBLE_DELETED_MESSAGES) {
+    const [oldestId, oldest] = visibleDeletedMessages.entries().next().value;
+    releaseDeletedMessage(oldestId, oldest.channelId);
+  }
+
+  markDeletedMessageAfterRender(messageId, channelId);
 }
 
 // Apply the retention limit on load as well, so an existing large archive is
@@ -497,10 +534,16 @@ function rememberMessage(message) {
 
   const previous = pendingMessages.get(incoming.id);
   const remembered = previous ? mergeArchiveEntry(previous, incoming) : incoming;
+  if (previous) pendingMessageBytes -= archiveEntryBytes(previous);
   // Map insertion order makes eviction inexpensive and bounds live memory.
   pendingMessages.delete(incoming.id);
   pendingMessages.set(incoming.id, remembered);
-  while (pendingMessages.size > MAX_PENDING_MESSAGES) pendingMessages.delete(pendingMessages.keys().next().value);
+  pendingMessageBytes += archiveEntryBytes(remembered);
+  while (pendingMessages.size > MAX_PENDING_MESSAGES || pendingMessageBytes > MAX_PENDING_BYTES) {
+    const [oldestId, oldest] = pendingMessages.entries().next().value;
+    pendingMessages.delete(oldestId);
+    pendingMessageBytes -= archiveEntryBytes(oldest);
+  }
   return true;
 }
 
@@ -574,6 +617,7 @@ function markDeleted(id, channelId) {
   const candidate = index === -1 ? [...current, archived] : current.map((entry, entryIndex) => (entryIndex === index ? archived : entry));
   const next = trimArchive(candidate);
   store[ARCHIVE_KEY] = next;
+  if (pending) pendingMessageBytes -= archiveEntryBytes(pending);
   pendingMessages.delete(messageId);
   if (next.some((entry) => entry.id === messageId)) cachePhotos(messageId, archived.attachments);
   scheduleArchiveTrim();
@@ -633,10 +677,11 @@ function handleDispatch(payload) {
       // Archive enrichment is best-effort and must never affect Discord's
       // normal delete processing.
     }
-    // Let Discord process the delete after the local archive snapshot is
-    // saved. Blocking it retains every deleted message in Discord's live Flux
-    // stores for the rest of the session, which causes unbounded RAM growth.
-    return;
+    // Keep the red in-chat treatment briefly, then explicitly release the
+    // message from Discord's store. This restores the visual cue without the
+    // former session-long memory retention.
+    retainDeletedMessagePreview(asString(messageId), asString(channelId));
+    return false;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
@@ -649,10 +694,15 @@ function handleDispatch(payload) {
       } catch {
         // Keep bulk retention independent from archive enrichment too.
       }
+      ids.forEach((id) => {
+        const messageId = asString(id?.id || id);
+        const messageChannelId = asString(id?.channel_id || id?.channelId || channelId);
+        retainDeletedMessagePreview(messageId, messageChannelId);
+      });
     }
-    // Do not block bulk deletes: retaining their snapshots in Discord's store
-    // is especially expensive in active channels.
-    return;
+    // Each retained row has an independent 30-second cleanup timer and the
+    // queue is capped, so bulk deletes cannot accumulate for a whole session.
+    return false;
   }
 }
 
@@ -1810,6 +1860,11 @@ export const settings = () => (
 
 export function onUnload() {
   clearTimeout(archiveTrimTimer);
+  for (const [messageId, preview] of [...visibleDeletedMessages]) {
+    releaseDeletedMessage(messageId, preview.channelId);
+  }
+  pendingMessages.clear();
+  pendingMessageBytes = 0;
   removeModal?.();
   removeModal = undefined;
   launcherHost?.remove();
