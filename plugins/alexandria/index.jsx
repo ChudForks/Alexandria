@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import styles from "./styles.css";
 
 const {
@@ -26,6 +26,12 @@ const {
 const ARCHIVE_KEY = "entries";
 const launcherId = "alexandria-launcher-host";
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+// Keeping every message in a busy server makes the persisted store and its
+// reactive updates grow without bound. This is intentionally a rolling local
+// archive; deleted entries are retained just like ordinary captured entries.
+const MAX_ARCHIVE_ENTRIES = 2_000;
+const MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
+const ARCHIVE_PAGE_SIZE = 100;
 
 store[ARCHIVE_KEY] ??= [];
 store.captureEnabled ??= true;
@@ -57,6 +63,7 @@ const photoCapturesInFlight = new Set();
 const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
 let activePhotoCaptures = 0;
+let archiveTrimTimer;
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
@@ -65,6 +72,76 @@ const fluxDispatcher = shelter.flux?.dispatcher;
 function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
 }
+
+function archiveActivityTime(entry) {
+  return Date.parse(entry.deletedAt || entry.timestamp) || 0;
+}
+
+function archiveEntryBytes(entry) {
+  // Avoid JSON.stringify here: serializing a multi-gigabyte photo archive
+  // creates another huge temporary string precisely when memory is scarce.
+  const textBytes = (value) => asString(value).length * 2;
+  let size = [
+    entry.id,
+    entry.channelId,
+    entry.guildId,
+    entry.guildName,
+    entry.directMessageName,
+    entry.channelName,
+    entry.authorId,
+    entry.author,
+    entry.username,
+    entry.content,
+    entry.timestamp,
+    entry.deletedAt,
+  ].reduce((total, value) => total + textBytes(value), 128);
+
+  for (const embed of entry.embeds || []) {
+    size += textBytes(embed.title) + textBytes(embed.description) + textBytes(embed.url);
+  }
+  for (const attachment of entry.attachments || []) {
+    size += textBytes(attachment.id) + textBytes(attachment.filename) + textBytes(attachment.url);
+    size += textBytes(attachment.proxyUrl) + textBytes(attachment.contentType);
+    // data URLs are ASCII/base64, so their string length is a close and
+    // deliberately conservative representation of their storage footprint.
+    size += asString(attachment.dataUrl).length;
+  }
+  return size;
+}
+
+function trimArchive(next) {
+  // Preserve the most recently active messages, rather than relying on the
+  // array order which can differ for migrated archives and message updates.
+  const mostRecent = next
+    .slice()
+    .sort((left, right) => archiveActivityTime(right) - archiveActivityTime(left));
+  let bytes = 0;
+  const retained = [];
+
+  for (const entry of mostRecent) {
+    const entryBytes = archiveEntryBytes(entry);
+    if (retained.length >= MAX_ARCHIVE_ENTRIES || bytes + entryBytes > MAX_ARCHIVE_BYTES) continue;
+    retained.push(entry);
+    bytes += entryBytes;
+  }
+
+  return retained.length === next.length ? next : retained;
+}
+
+function scheduleArchiveTrim() {
+  clearTimeout(archiveTrimTimer);
+  archiveTrimTimer = setTimeout(() => {
+    const current = entries();
+    const trimmed = trimArchive(current);
+    if (trimmed !== current) store[ARCHIVE_KEY] = trimmed;
+  }, 250);
+}
+
+// Apply the retention limit on load as well, so an existing large archive is
+// released at the next plugin start instead of only limiting future messages.
+const initialEntries = entries();
+const trimmedInitialEntries = trimArchive(initialEntries);
+if (trimmedInitialEntries !== initialEntries) store[ARCHIVE_KEY] = trimmedInitialEntries;
 
 async function photoBlobForClipboard(dataUrl) {
   const blob = await fetch(dataUrl).then((response) => response.blob());
@@ -299,6 +376,7 @@ function setPhotoCaptureStatus(messageId, key, photoUnavailable) {
   const next = [...current];
   next[entryIndex] = { ...next[entryIndex], attachments };
   store[ARCHIVE_KEY] = next;
+  scheduleArchiveTrim();
 }
 
 async function cachePhoto(messageId, attachment) {
@@ -352,6 +430,7 @@ async function cachePhoto(messageId, attachment) {
     const next = [...current];
     next[entryIndex] = { ...next[entryIndex], attachments };
     store[ARCHIVE_KEY] = next;
+    scheduleArchiveTrim();
   } catch {
     // A CDN request can fail after a message is deleted. Keep a visible status
     // instead of presenting the expiring remote link as archived content.
@@ -402,8 +481,16 @@ function saveMessage(message) {
   const index = current.findIndex((entry) => entry.id === incoming.id);
 
   if (index === -1) {
-    store[ARCHIVE_KEY] = [...current, { ...incoming, deleted: false, deletedAt: null }];
-    cachePhotos(incoming.id, incoming.attachments);
+    const candidate = [...current, { ...incoming, deleted: false, deletedAt: null }];
+    // Count trimming is immediate. Byte trimming is debounced below so a busy
+    // channel does not repeatedly scan and sort the entire archive per event.
+    const next = candidate.length > MAX_ARCHIVE_ENTRIES ? trimArchive(candidate) : candidate;
+    store[ARCHIVE_KEY] = next;
+    scheduleArchiveTrim();
+    // A newly added entry can be evicted immediately when an imported archive
+    // contains timestamps in the future. Do not download media for an entry
+    // that is no longer retained.
+    if (next.some((entry) => entry.id === incoming.id)) cachePhotos(incoming.id, incoming.attachments);
     return true;
   }
 
@@ -473,33 +560,6 @@ function messageFromRenderedDom(id, channelId) {
   }
 
   return null;
-}
-
-function retainMessageInStore(message, id, channelId) {
-  const messageId = asString(id || message?.id);
-  const currentChannelId = asString(channelId || message?.channel_id || message?.channelId);
-  const snapshot =
-    message ||
-    messageFromStore(messageId, currentChannelId) ||
-    messageFromRenderedDom(messageId, currentChannelId);
-  if (!snapshot?.id || !currentChannelId) return;
-
-  setTimeout(() => {
-    const retained = messageFromStore(messageId, currentChannelId);
-    if (!retained) {
-      try {
-        fluxDispatcher?.dispatch?.({
-          type: "MESSAGE_CREATE",
-          channelId: currentChannelId,
-          message: snapshot,
-          alexandriaRetained: true,
-        });
-      } catch {
-        // Blocking the original delete remains the primary retention path.
-      }
-    }
-    markDeletedMessageAfterRender(messageId, currentChannelId);
-  }, 0);
 }
 
 function markDeleted(id, channelId) {
@@ -582,32 +642,19 @@ function handleDispatch(payload) {
     try {
       markDeleted(messageId, channelId);
     } catch {
-      // Archive enrichment is best-effort. It must never prevent the local
-      // delete interceptor from preserving Discord's cached message.
+      // Archive enrichment is best-effort and must never affect Discord's
+      // normal delete processing.
     }
-    // Shelter lets a Flux interceptor stop a dispatch by returning false. This
-    // retains the message in Discord's in-memory store until a client restart,
-    // mirroring MessageLogger's session-only behavior.
-    // Retention must not depend on whether archive recovery succeeded. The
-    // server has already deleted the message; blocking this dispatch only
-    // preserves Discord's local cached copy for the current client session.
-    retainMessageInStore(snapshot, messageId, channelId);
-    return false;
+    // Let Discord process the delete after the local archive snapshot is
+    // saved. Blocking it retains every deleted message in Discord's live Flux
+    // stores for the rest of the session, which causes unbounded RAM growth.
+    return;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
     const ids = payload.ids || payload.messageIds || payload.messages;
     const channelId = payload.channel_id || payload.channelId;
     if (!shouldCaptureMessage(null, channelId)) return;
-    const snapshots = Array.isArray(ids)
-      ? ids.map((id) => {
-          const messageId = id?.id || id;
-          return {
-            id: messageId,
-            message: messageFromStore(asString(messageId), asString(id?.channel_id || id?.channelId || channelId)),
-          };
-        })
-      : [];
     if (Array.isArray(ids)) {
       try {
         ids.forEach((id) => markDeleted(id?.id || id, id?.channel_id || id?.channelId || channelId));
@@ -615,8 +662,9 @@ function handleDispatch(payload) {
         // Keep bulk retention independent from archive enrichment too.
       }
     }
-    snapshots.forEach(({ id, message }) => retainMessageInStore(message, id, channelId));
-    return false;
+    // Do not block bulk deletes: retaining their snapshots in Discord's store
+    // is especially expensive in active channels.
+    return;
   }
 }
 
@@ -1202,6 +1250,7 @@ function ArchiveModal(props) {
   const [selectedServer, setSelectedServer] = createSignal(store.serverFilter || "");
   const [selectedUser, setSelectedUser] = createSignal(store.userFilter || "");
   const [selectedDirectMessage, setSelectedDirectMessage] = createSignal(store.directMessageFilter || "");
+  const [resultLimit, setResultLimit] = createSignal(ARCHIVE_PAGE_SIZE);
 
   const serverOptions = () => {
     const options = new Map();
@@ -1241,7 +1290,7 @@ function ArchiveModal(props) {
       .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
   };
 
-  const visibleEntries = () => {
+  const visibleEntries = createMemo(() => {
     const search = query().trim().toLowerCase();
 
     return entries()
@@ -1269,11 +1318,25 @@ function ArchiveModal(props) {
           if (serverOrder !== 0) return serverOrder;
         }
 
-        const leftTime = Date.parse(left.deletedAt || left.timestamp) || 0;
-        const rightTime = Date.parse(right.deletedAt || right.timestamp) || 0;
+        const leftTime = archiveActivityTime(left);
+        const rightTime = archiveActivityTime(right);
         return rightTime - leftTime;
       });
-  };
+  });
+
+  const displayedEntries = () => visibleEntries().slice(0, resultLimit());
+
+  // A changed query, filter, view, or sort should always start at the first
+  // page, rather than leaving the user at an arbitrary old page length.
+  createEffect(() => {
+    query();
+    showAll();
+    sortMode();
+    selectedServer();
+    selectedUser();
+    selectedDirectMessage();
+    setResultLimit(ARCHIVE_PAGE_SIZE);
+  });
 
   const activeFilterCount = () =>
     [query().trim(), selectedServer(), selectedUser(), selectedDirectMessage()].filter(Boolean).length;
@@ -1420,7 +1483,7 @@ function ArchiveModal(props) {
           }
         >
           <div class="alexandria-list">
-            <For each={visibleEntries()}>
+            <For each={displayedEntries()}>
               {(entry) => (
                 <article class={`alexandria-entry ${entry.deleted ? "is-deleted" : "is-captured"}`}>
                   <div class="alexandria-entry-heading">
@@ -1506,6 +1569,15 @@ function ArchiveModal(props) {
                 </article>
               )}
             </For>
+            <Show when={visibleEntries().length > resultLimit()}>
+              <button
+                class="alexandria-load-more"
+                type="button"
+                onClick={() => setResultLimit((limit) => limit + ARCHIVE_PAGE_SIZE)}
+              >
+                Show {Math.min(ARCHIVE_PAGE_SIZE, visibleEntries().length - resultLimit())} more
+              </button>
+            </Show>
           </div>
         </Show>
       </ModalBody>
@@ -1735,7 +1807,7 @@ export const settings = () => (
         <span>Storage used</span>
         <strong>{formatBytes(storageBytes())}</strong>
       </div>
-      <p>Approximate persistent data stored by Alexandria, including cached photos.</p>
+      <p>Approximate persistent data stored by Alexandria, including cached photos. The rolling archive is capped at 2,000 entries or 250 MB.</p>
     </div>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
@@ -1749,6 +1821,7 @@ export const settings = () => (
 );
 
 export function onUnload() {
+  clearTimeout(archiveTrimTimer);
   removeModal?.();
   removeModal = undefined;
   launcherHost?.remove();
