@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 import styles from "./styles.css";
 
 const {
@@ -24,6 +24,10 @@ const {
 } = shelter;
 
 const ARCHIVE_KEY = "entries";
+const ARCHIVE_SCHEMA_VERSION = 2;
+const MEDIA_DATABASE_NAME = "alexandria-media";
+const MEDIA_DATABASE_VERSION = 1;
+const MEDIA_STORE_NAME = "photos";
 const launcherId = "alexandria-launcher-host";
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 // Keeping every message in a busy server makes the persisted store and its
@@ -33,11 +37,22 @@ const MAX_ARCHIVE_ENTRIES = 2_000;
 const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_PENDING_MESSAGES = 250;
 const MAX_PENDING_BYTES = 16 * 1024 * 1024;
+const MAX_PENDING_PHOTO_BYTES = 300 * 1024 * 1024;
 const MAX_VISIBLE_DELETED_MESSAGES = 250;
 const MAX_VISIBLE_DELETED_BYTES = 300 * 1024 * 1024;
+const MAX_LIVE_IMAGE_EDGE = 512;
+const MAX_ARCHIVE_IMAGE_EDGE = 2_048;
+const MIN_LIVE_MESSAGE_BYTES = 64 * 1024;
 const ARCHIVE_PAGE_SIZE = 100;
 
 store[ARCHIVE_KEY] ??= [];
+// Version 0.8 intentionally starts a fresh archive. Earlier releases embedded
+// base64 photos directly in the reactive store; retaining those would defeat
+// the new disk-backed memory model.
+if (store.archiveSchemaVersion !== ARCHIVE_SCHEMA_VERSION) {
+  store[ARCHIVE_KEY] = [];
+  store.archiveSchemaVersion = ARCHIVE_SCHEMA_VERSION;
+}
 store.captureEnabled ??= true;
 store.captureMode ??= "all";
 store.selectedGuildIds ??= [];
@@ -64,18 +79,95 @@ let removePhotoModal;
 let stopLauncherDrag;
 let suppressLauncherClick = false;
 const photoCapturesInFlight = new Set();
+const photoRepairsInFlight = new Set();
 const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
 let activePhotoCaptures = 0;
 let archiveTrimTimer;
+let mediaDatabasePromise;
+let mediaReadyPromise;
+let pluginUnloading = false;
+let livePreviewWork = Promise.resolve();
 const pendingMessages = new Map();
 let pendingMessageBytes = 0;
+let pendingPhotoBytes = 0;
 const visibleDeletedMessages = new Map();
 let visibleDeletedMessageBytes = 0;
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
 const fluxDispatcher = shelter.flux?.dispatcher;
+
+function mediaDatabase() {
+  mediaDatabasePromise ??= new Promise((resolve, reject) => {
+    const request = indexedDB.open(MEDIA_DATABASE_NAME, MEDIA_DATABASE_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(MEDIA_STORE_NAME)) {
+        database.createObjectStore(MEDIA_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => reject(new Error("Alexandria media database is blocked."));
+  });
+  return mediaDatabasePromise;
+}
+
+function transactionComplete(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error || new Error("Media transaction aborted."));
+    transaction.onerror = () => reject(transaction.error || new Error("Media transaction failed."));
+  });
+}
+
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function readPhotoBlob(blobKey) {
+  if (!blobKey) return null;
+  const database = await mediaDatabase();
+  const transaction = database.transaction(MEDIA_STORE_NAME, "readonly");
+  return requestResult(transaction.objectStore(MEDIA_STORE_NAME).get(blobKey));
+}
+
+async function writePhotoBlob(blobKey, blob) {
+  await prepareMediaDatabase();
+  const database = await mediaDatabase();
+  const transaction = database.transaction(MEDIA_STORE_NAME, "readwrite");
+  transaction.objectStore(MEDIA_STORE_NAME).put(blob, blobKey);
+  await transactionComplete(transaction);
+}
+
+async function deletePhotoBlobs(blobKeys) {
+  const keys = [...new Set(blobKeys.filter(Boolean))];
+  if (!keys.length) return;
+  const database = await mediaDatabase();
+  const transaction = database.transaction(MEDIA_STORE_NAME, "readwrite");
+  const photos = transaction.objectStore(MEDIA_STORE_NAME);
+  keys.forEach((key) => photos.delete(key));
+  await transactionComplete(transaction);
+}
+
+function entryPhotoKeys(entry) {
+  return (entry?.attachments || []).map((attachment) => attachment.blobKey).filter(Boolean);
+}
+
+function prepareMediaDatabase() {
+  mediaReadyPromise ??= (async () => {
+    const database = await mediaDatabase();
+    const transaction = database.transaction(MEDIA_STORE_NAME, "readonly");
+    const keys = await requestResult(transaction.objectStore(MEDIA_STORE_NAME).getAllKeys());
+    const retainedKeys = new Set(entries().flatMap(entryPhotoKeys));
+    await deletePhotoBlobs(keys.filter((key) => !retainedKeys.has(key)));
+  })();
+  return mediaReadyPromise;
+}
 
 function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
@@ -86,8 +178,8 @@ function archiveActivityTime(entry) {
 }
 
 function archiveEntryBytes(entry) {
-  // Avoid JSON.stringify here: serializing a multi-gigabyte photo archive
-  // creates another huge temporary string precisely when memory is scarce.
+  // Photo blobs live in IndexedDB, so count their recorded byte sizes without
+  // loading them into memory or serializing them into Shelter's store.
   const textBytes = (value) => asString(value).length * 2;
   let size = [
     entry.id,
@@ -110,16 +202,62 @@ function archiveEntryBytes(entry) {
   for (const attachment of entry.attachments || []) {
     size += textBytes(attachment.id) + textBytes(attachment.filename) + textBytes(attachment.url);
     size += textBytes(attachment.proxyUrl) + textBytes(attachment.contentType);
-    // data URLs are ASCII/base64, so their string length is a close and
-    // deliberately conservative representation of their storage footprint.
-    size += asString(attachment.dataUrl).length;
+    size += Math.max(0, Number(attachment.cachedBytes) || 0);
   }
   return size;
 }
 
+function pendingEntryBytes(entry) {
+  return Math.max(
+    0,
+    archiveEntryBytes(entry) -
+      (entry?.attachments || []).reduce(
+        (total, attachment) => total + Math.max(0, Number(attachment.cachedBytes) || 0),
+        0,
+      ),
+  );
+}
+
+function pendingEntryPhotoBytes(entry) {
+  return (entry?.attachments || []).reduce(
+    (total, attachment) => total + Math.max(0, Number(attachment.cachedBytes) || 0),
+    0,
+  );
+}
+
+function discardPendingEntry(entry) {
+  if (!entry) return;
+  pendingMessageBytes = Math.max(0, pendingMessageBytes - pendingEntryBytes(entry));
+  pendingPhotoBytes = Math.max(0, pendingPhotoBytes - pendingEntryPhotoBytes(entry));
+  void deletePhotoBlobs(entryPhotoKeys(entry)).catch((error) => {
+    console.error("[Alexandria] Could not remove pre-delete photo blobs", error);
+  });
+}
+
+function trimPendingPhotoCache() {
+  if (pendingPhotoBytes <= MAX_PENDING_PHOTO_BYTES) return;
+
+  for (const [messageId, entry] of pendingMessages) {
+    if (pendingPhotoBytes <= MAX_PENDING_PHOTO_BYTES) break;
+    const photoKeys = entryPhotoKeys(entry);
+    if (!photoKeys.length) continue;
+    const removedBytes = pendingEntryPhotoBytes(entry);
+    const attachments = entry.attachments.map((attachment) => {
+      if (!attachment.blobKey) return attachment;
+      const { blobKey, cachedBytes, ...metadata } = attachment;
+      return metadata;
+    });
+    pendingMessages.set(messageId, { ...entry, attachments });
+    pendingPhotoBytes = Math.max(0, pendingPhotoBytes - removedBytes);
+    void deletePhotoBlobs(photoKeys).catch((error) => {
+      console.error("[Alexandria] Could not trim pre-delete photo blobs", error);
+    });
+  }
+}
+
 function liveMessageBytes(message) {
   const entry = toArchiveEntry(message);
-  let size = entry ? archiveEntryBytes(entry) : 128;
+  let size = entry ? archiveEntryBytes(entry) : MIN_LIVE_MESSAGE_BYTES;
 
   // Retained Discord rows can keep both the encoded attachment and its
   // decoded image surface alive. Count both when metadata is available so a
@@ -133,7 +271,158 @@ function liveMessageBytes(message) {
     size += encodedBytes + decodedBytes;
   }
 
-  return Math.max(128, size);
+  for (const embed of Array.isArray(message?.embeds) ? message.embeds : []) {
+    for (const media of [embed?.image, embed?.thumbnail]) {
+      if (!media) continue;
+      const { width, height } = compactMediaDimensions(media.width, media.height);
+      size += width * height * 4;
+    }
+  }
+
+  return Math.max(MIN_LIVE_MESSAGE_BYTES, size);
+}
+
+function compactMediaDimensions(widthValue, heightValue) {
+  const width = Math.max(0, Number(widthValue) || 0);
+  const height = Math.max(0, Number(heightValue) || 0);
+  if (!width || !height) return { width: MAX_LIVE_IMAGE_EDGE, height: MAX_LIVE_IMAGE_EDGE };
+
+  const scale = Math.min(1, MAX_LIVE_IMAGE_EDGE / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale)),
+  };
+}
+
+async function liveThumbnailBlob(blob, widthValue, heightValue) {
+  const dimensions = compactMediaDimensions(widthValue, heightValue);
+  const objectUrl = URL.createObjectURL(blob);
+  const image = new Image();
+  image.src = objectUrl;
+
+  try {
+    await image.decode();
+    const naturalDimensions = compactMediaDimensions(image.naturalWidth, image.naturalHeight);
+    const width = Math.min(dimensions.width, naturalDimensions.width);
+    const height = Math.min(dimensions.height, naturalDimensions.height);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+    return await new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (preview) => (preview ? resolve(preview) : reject(new Error("Could not create live preview."))),
+        "image/webp",
+        0.82,
+      );
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function applyCompactedRetainedMessage(messageId, channelId, message) {
+  const preview = visibleDeletedMessages.get(messageId);
+  if (!preview || pluginUnloading) return;
+
+  const archived = entries().find((entry) => entry.id === messageId);
+  const archivedAttachments = archived?.attachments || [];
+  const sourceAttachments = Array.isArray(message?.attachments) ? message.attachments : archivedAttachments;
+  const imageAttachments = archivedAttachments.filter((attachment) => attachment.isImage);
+
+  // Until every image has been captured, leave Discord's exact pre-delete
+  // URL untouched. Rewriting an older signed URL after deletion can invalidate
+  // it even though the already-rendered pre-delete URL still works.
+  if (imageAttachments.some((attachment) => !attachment.blobKey)) return;
+
+  const objectUrls = [];
+  try {
+    const attachments = [];
+    for (const archivedAttachment of archivedAttachments) {
+      const source = sourceAttachments.find(
+        (attachment) => attachmentKey(attachment) === attachmentKey(archivedAttachment),
+      ) || archivedAttachment;
+      if (!archivedAttachment.isImage) {
+        attachments.push({ ...source, waveform: undefined });
+        continue;
+      }
+
+      const blob = await readPhotoBlob(archivedAttachment.blobKey);
+      if (!(blob instanceof Blob)) return;
+      const thumbnail = await liveThumbnailBlob(blob, archivedAttachment.width, archivedAttachment.height);
+      const objectUrl = URL.createObjectURL(thumbnail);
+      objectUrls.push(objectUrl);
+      const dimensions = compactMediaDimensions(archivedAttachment.width, archivedAttachment.height);
+      attachments.push({
+        ...source,
+        id: archivedAttachment.id,
+        filename: archivedAttachment.filename,
+        url: objectUrl,
+        proxy_url: objectUrl,
+        proxyUrl: objectUrl,
+        proxyURL: objectUrl,
+        download_url: objectUrl,
+        downloadUrl: objectUrl,
+        originalUrl: archivedAttachment.url,
+        content_type: thumbnail.type,
+        contentType: thumbnail.type,
+        size: thumbnail.size,
+        width: dimensions.width,
+        height: dimensions.height,
+        waveform: undefined,
+      });
+    }
+
+    const compacted = {
+      id: messageId,
+      channel_id: channelId,
+      content: asString(message?.content || archived?.content),
+      attachments,
+      embeds: (Array.isArray(message?.embeds) ? message.embeds : []).map((embed) => ({
+        ...embed,
+        video: undefined,
+      })),
+      sticker_items: [],
+      stickers: [],
+      components: [],
+    };
+
+    const currentPreview = visibleDeletedMessages.get(messageId);
+    if (!currentPreview || pluginUnloading) return;
+    (currentPreview.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
+    visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - currentPreview.bytes);
+    currentPreview.objectUrls = objectUrls.splice(0);
+    currentPreview.bytes = liveMessageBytes(compacted);
+    visibleDeletedMessageBytes += currentPreview.bytes;
+
+    while (
+      visibleDeletedMessages.size > MAX_VISIBLE_DELETED_MESSAGES ||
+      visibleDeletedMessageBytes > MAX_VISIBLE_DELETED_BYTES
+    ) {
+      const [oldestId, oldest] = visibleDeletedMessages.entries().next().value;
+      releaseDeletedMessage(oldestId, oldest.channelId);
+    }
+    if (!visibleDeletedMessages.has(messageId)) return;
+
+    fluxDispatcher?.dispatch?.({
+      type: "MESSAGE_UPDATE",
+      message: compacted,
+      alexandriaCompact: true,
+    });
+    markDeletedMessageAfterRender(messageId, channelId);
+  } catch (error) {
+    console.error("[Alexandria] Could not create a bounded live photo preview", error);
+  } finally {
+    objectUrls.forEach((url) => URL.revokeObjectURL(url));
+  }
+}
+
+function compactRetainedMessage(messageId, channelId, message) {
+  const retainedMessage = message || messageFromStore(messageId, channelId) || entries().find((entry) => entry.id === messageId);
+  livePreviewWork = livePreviewWork
+    .then(() => applyCompactedRetainedMessage(messageId, channelId, retainedMessage))
+    .catch((error) => console.error("[Alexandria] Live preview queue failed", error));
+  return retainedMessage;
 }
 
 function trimArchive(next) {
@@ -152,7 +441,16 @@ function trimArchive(next) {
     bytes += entryBytes;
   }
 
-  return retained.length === next.length ? next : retained;
+  if (retained.length === next.length) return next;
+
+  const retainedIds = new Set(retained.map((entry) => entry.id));
+  const removedPhotoKeys = next
+    .filter((entry) => !retainedIds.has(entry.id))
+    .flatMap(entryPhotoKeys);
+  void deletePhotoBlobs(removedPhotoKeys).catch((error) => {
+    console.error("[Alexandria] Could not remove trimmed photo blobs", error);
+  });
+  return retained;
 }
 
 function scheduleArchiveTrim() {
@@ -166,7 +464,10 @@ function scheduleArchiveTrim() {
 
 function releaseDeletedMessage(messageId, channelId) {
   const preview = visibleDeletedMessages.get(messageId);
-  if (preview) visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - preview.bytes);
+  if (preview) {
+    visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - preview.bytes);
+    (preview.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
+  }
   visibleDeletedMessages.delete(messageId);
   fluxDispatcher?.dispatch?.({
     type: "MESSAGE_DELETE",
@@ -179,12 +480,16 @@ function releaseDeletedMessage(messageId, channelId) {
 function retainDeletedMessagePreview(messageId, channelId, message) {
   if (!messageId || !channelId) return;
   const previous = visibleDeletedMessages.get(messageId);
-  if (previous) visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - previous.bytes);
+  if (previous) {
+    visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - previous.bytes);
+    (previous.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
+  }
   const retainedMessage = message || entries().find((entry) => entry.id === messageId);
 
   const preview = {
     channelId,
     bytes: liveMessageBytes(retainedMessage),
+    objectUrls: [],
   };
   visibleDeletedMessages.delete(messageId);
   visibleDeletedMessages.set(messageId, preview);
@@ -207,41 +512,41 @@ const initialEntries = entries();
 const trimmedInitialEntries = trimArchive(initialEntries);
 if (trimmedInitialEntries !== initialEntries) store[ARCHIVE_KEY] = trimmedInitialEntries;
 
-async function photoBlobForClipboard(dataUrl) {
-  const blob = await fetch(dataUrl).then((response) => response.blob());
-
+async function photoBlobForClipboard(blob) {
   // Chromium reliably accepts PNG clipboard images, so convert unsupported
   // stored formats before the second clipboard attempt.
   if (blob.type === "image/png") return blob;
 
   const image = new Image();
-  image.src = dataUrl;
-  await image.decode();
+  const objectUrl = URL.createObjectURL(blob);
+  image.src = objectUrl;
+  try {
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    canvas.getContext("2d").drawImage(image, 0, 0);
 
-  const canvas = document.createElement("canvas");
-  canvas.width = image.naturalWidth;
-  canvas.height = image.naturalHeight;
-  canvas.getContext("2d").drawImage(image, 0, 0);
-
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      (png) => (png ? resolve(png) : reject(new Error("Could not prepare the photo for copying."))),
-      "image/png",
-    );
-  });
+    return await new Promise((resolve, reject) => {
+      canvas.toBlob(
+        (png) => (png ? resolve(png) : reject(new Error("Could not prepare the photo for copying."))),
+        "image/png",
+      );
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
-async function copyPhoto(dataUrl) {
+async function copyPhoto(blob) {
   if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
     throw new Error("Image copying is not available in this Discord client.");
   }
 
-  const original = await fetch(dataUrl).then((response) => response.blob());
-
   try {
-    await navigator.clipboard.write([new ClipboardItem({ [original.type]: original })]);
+    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
   } catch {
-    const png = await photoBlobForClipboard(dataUrl);
+    const png = await photoBlobForClipboard(blob);
     await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
   }
 }
@@ -261,8 +566,10 @@ function imageTypeFromFilename(filename) {
 function normaliseAttachment(attachment) {
   const filename = asString(attachment?.filename || attachment?.name, "Attachment");
   const contentType = asString(attachment?.content_type || attachment?.contentType);
-  const url = asString(attachment?.url);
-  const proxyUrl = asString(attachment?.proxy_url || attachment?.proxyUrl);
+  const url = asString(attachment?.url || attachment?.download_url || attachment?.downloadUrl);
+  const proxyUrl = asString(
+    attachment?.proxy_url || attachment?.proxyUrl || attachment?.proxyURL || attachment?.preview_url,
+  );
 
   return {
     id: asString(attachment?.id),
@@ -417,22 +724,23 @@ function sameJSON(left, right) {
 function mergeAttachments(incoming, previous = []) {
   return incoming.map((attachment) => {
     const captured = previous.find((item) => attachmentKey(item) === attachmentKey(attachment));
-    return captured?.dataUrl ? { ...attachment, dataUrl: captured.dataUrl } : attachment;
-  });
-}
-
-function readBlobAsDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
+    return captured?.blobKey
+      ? {
+          ...attachment,
+          blobKey: captured.blobKey,
+          cachedBytes: captured.cachedBytes,
+          photoUnavailable: captured.photoUnavailable,
+        }
+      : attachment;
   });
 }
 
 async function readBoundedResponseBlob(response) {
   const contentLength = Number(response.headers.get("content-length"));
-  if (contentLength && contentLength > MAX_PHOTO_BYTES) return null;
+  if (contentLength && contentLength > MAX_PHOTO_BYTES) {
+    await response.body?.cancel?.();
+    return null;
+  }
 
   if (!response.body?.getReader) {
     const blob = await response.blob();
@@ -461,10 +769,52 @@ async function readBoundedResponseBlob(response) {
   return new Blob(chunks, { type: response.headers.get("content-type") || "" });
 }
 
+function discordMediaFallbackUrls(attachment) {
+  const source = asString(attachment?.proxyUrl || attachment?.url);
+  if (!source) return [];
+
+  try {
+    const url = new URL(source);
+    if (!/^(?:cdn|media)\.discordapp\.(?:com|net)$/.test(url.hostname)) return [];
+    if (!url.pathname.includes("/attachments/")) return [];
+    url.hostname = "media.discordapp.net";
+    const naturalWidth = Math.max(1, Number(attachment?.width) || 4);
+    const naturalHeight = Math.max(1, Number(attachment?.height) || 3);
+    const candidateWidths = [
+      Math.min(naturalWidth, 1_280),
+      Math.min(naturalWidth, 960),
+      Math.min(naturalWidth, 640),
+      Math.min(naturalWidth, MAX_ARCHIVE_IMAGE_EDGE),
+    ];
+    return [...new Set(candidateWidths)]
+      .filter((width) => width > 0)
+      .map((width) => {
+        const candidate = new URL(url);
+        candidate.searchParams.set("format", "webp");
+        candidate.searchParams.set("width", String(Math.round(width)));
+        candidate.searchParams.set(
+          "height",
+          String(Math.max(1, Math.round((width * naturalHeight) / naturalWidth))),
+        );
+        return candidate.toString();
+      });
+  } catch {
+    return [];
+  }
+}
+
 function setPhotoCaptureStatus(messageId, key, photoUnavailable) {
   const current = entries();
   const entryIndex = current.findIndex((entry) => entry.id === messageId);
-  if (entryIndex === -1) return;
+  if (entryIndex === -1) {
+    const pending = pendingMessages.get(messageId);
+    if (!pending) return;
+    const attachments = pending.attachments.map((item) =>
+      attachmentKey(item) === key ? { ...item, photoUnavailable } : item,
+    );
+    pendingMessages.set(messageId, { ...pending, attachments });
+    return;
+  }
 
   const attachments = current[entryIndex].attachments.map((item) =>
     attachmentKey(item) === key ? { ...item, photoUnavailable } : item,
@@ -478,7 +828,12 @@ function setPhotoCaptureStatus(messageId, key, photoUnavailable) {
 }
 
 async function cachePhoto(messageId, attachment) {
-  const sourceUrls = [...new Set([attachment.proxyUrl, attachment.url].filter(Boolean))];
+  const photoSourceUrls = (candidate) => [
+    candidate?.proxyUrl,
+    ...discordMediaFallbackUrls(candidate),
+    candidate?.url,
+  ].filter(Boolean);
+  const sourceUrls = [...new Set(photoSourceUrls(attachment))];
   if (!attachment.isImage || sourceUrls.length === 0) return;
 
   const key = attachmentKey(attachment);
@@ -489,7 +844,15 @@ async function cachePhoto(messageId, attachment) {
   try {
     let blob;
 
-    for (const sourceUrl of sourceUrls) {
+    for (let sourceIndex = 0; sourceIndex < sourceUrls.length; sourceIndex += 1) {
+      const latestEntry = pendingMessages.get(messageId) || entries().find((entry) => entry.id === messageId);
+      const latestAttachment = latestEntry?.attachments?.find(
+        (item) => attachmentKey(item) === attachmentKey(attachment),
+      );
+      photoSourceUrls(latestAttachment).forEach((url) => {
+        if (!sourceUrls.includes(url)) sourceUrls.push(url);
+      });
+      const sourceUrl = sourceUrls[sourceIndex];
       const response = await fetch(sourceUrl);
       if (!response.ok) continue;
 
@@ -514,21 +877,63 @@ async function cachePhoto(messageId, attachment) {
       return;
     }
 
-    const dataUrl = await readBlobAsDataUrl(blob);
-    const current = entries();
-    const entryIndex = current.findIndex((entry) => entry.id === messageId);
-    if (entryIndex === -1) return;
+    if (pluginUnloading) return;
+    let current = entries();
+    let entryIndex = current.findIndex((entry) => entry.id === messageId);
+    if (entryIndex === -1 && !pendingMessages.has(messageId)) return;
+
+    const blobKey = captureKey;
+    await writePhotoBlob(blobKey, blob);
+    current = entries();
+    entryIndex = current.findIndex((entry) => entry.id === messageId);
+    const pending = pendingMessages.get(messageId);
+    if (pluginUnloading || (entryIndex === -1 && !pending)) {
+      await deletePhotoBlobs([blobKey]);
+      return;
+    }
+
+    if (entryIndex === -1) {
+      const attachments = pending.attachments.map((item) =>
+        attachmentKey(item) === key && !item.blobKey
+          ? { ...item, blobKey, cachedBytes: blob.size, photoUnavailable: false }
+          : item,
+      );
+      if (sameJSON(attachments, pending.attachments)) {
+        await deletePhotoBlobs([blobKey]);
+        return;
+      }
+      const remembered = { ...pending, attachments };
+      pendingMessageBytes -= pendingEntryBytes(pending);
+      pendingPhotoBytes -= pendingEntryPhotoBytes(pending);
+      pendingMessages.set(messageId, remembered);
+      pendingMessageBytes += pendingEntryBytes(remembered);
+      pendingPhotoBytes += pendingEntryPhotoBytes(remembered);
+      trimPendingPhotoCache();
+      return;
+    }
 
     const attachments = current[entryIndex].attachments.map((item) =>
-      attachmentKey(item) === key && !item.dataUrl ? { ...item, dataUrl, photoUnavailable: false } : item,
+      attachmentKey(item) === key && !item.blobKey
+        ? { ...item, blobKey, cachedBytes: blob.size, photoUnavailable: false }
+        : item,
     );
-    if (sameJSON(attachments, current[entryIndex].attachments)) return;
+    if (sameJSON(attachments, current[entryIndex].attachments)) {
+      await deletePhotoBlobs([blobKey]);
+      return;
+    }
 
     const next = [...current];
     next[entryIndex] = { ...next[entryIndex], attachments };
     // Enforce the persistent cap before assigning into the reactive store so
     // an oversized intermediate archive is never handed to persistence.
     store[ARCHIVE_KEY] = trimArchive(next);
+    if (visibleDeletedMessages.has(messageId)) {
+      compactRetainedMessage(
+        messageId,
+        current[entryIndex].channelId,
+        messageFromStore(messageId, current[entryIndex].channelId),
+      );
+    }
   } catch {
     // A CDN request can fail after a message is deleted. Keep a visible status
     // instead of presenting the expiring remote link as archived content.
@@ -540,7 +945,7 @@ async function cachePhoto(messageId, attachment) {
 
 function cachePhotos(messageId, attachments) {
   attachments.forEach((attachment) => {
-    if (!attachment.isImage || attachment.dataUrl) return;
+    if (!attachment.isImage || attachment.blobKey) return;
 
     const captureKey = `${messageId}:${attachmentKey(attachment)}`;
     if (photoCapturesInFlight.has(captureKey) || queuedPhotoCaptures.has(captureKey)) return;
@@ -556,6 +961,7 @@ function drainPhotoCaptureQueue() {
   while (activePhotoCaptures < 3 && photoCaptureQueue.length) {
     const { messageId, attachment, captureKey } = photoCaptureQueue.shift();
     queuedPhotoCaptures.delete(captureKey);
+    if (!pendingMessages.has(messageId) && !entries().some((entry) => entry.id === messageId)) continue;
     activePhotoCaptures += 1;
 
     void cachePhoto(messageId, attachment).finally(() => {
@@ -593,16 +999,21 @@ function rememberMessage(message) {
 
   const previous = pendingMessages.get(incoming.id);
   const remembered = previous ? mergeArchiveEntry(previous, incoming) : incoming;
-  if (previous) pendingMessageBytes -= archiveEntryBytes(previous);
+  if (previous) {
+    pendingMessageBytes -= pendingEntryBytes(previous);
+    pendingPhotoBytes -= pendingEntryPhotoBytes(previous);
+  }
   // Map insertion order makes eviction inexpensive and bounds live memory.
   pendingMessages.delete(incoming.id);
   pendingMessages.set(incoming.id, remembered);
-  pendingMessageBytes += archiveEntryBytes(remembered);
+  pendingMessageBytes += pendingEntryBytes(remembered);
+  pendingPhotoBytes += pendingEntryPhotoBytes(remembered);
   while (pendingMessages.size > MAX_PENDING_MESSAGES || pendingMessageBytes > MAX_PENDING_BYTES) {
     const [oldestId, oldest] = pendingMessages.entries().next().value;
     pendingMessages.delete(oldestId);
-    pendingMessageBytes -= archiveEntryBytes(oldest);
+    discardPendingEntry(oldest);
   }
+  cachePhotos(remembered.id, remembered.attachments);
   return true;
 }
 
@@ -639,10 +1050,39 @@ function messageFromRenderedDom(id, channelId) {
 
   for (const element of candidates) {
     const message = messageFromRenderedElement(element);
-    if (message?.id === messageId) return message;
+    if (message?.id === messageId) return messageWithRenderedAttachmentUrls(message, element);
   }
 
   return null;
+}
+
+function messageWithRenderedAttachmentUrls(message, element) {
+  if (!message || !Array.isArray(message.attachments) || !message.attachments.length) return message;
+  const row = element?.closest?.('[data-list-item-id], li') || element;
+  const renderedUrls = [
+    ...(row?.querySelectorAll?.('img[src*="/attachments/"], video[src*="/attachments/"]') || []),
+  ]
+    .map((media) => asString(media.currentSrc || media.src))
+    .filter(Boolean);
+  if (!renderedUrls.length) return message;
+
+  const attachments = message.attachments.map((attachment) => {
+    const id = asString(attachment?.id);
+    const filename = asString(attachment?.filename || attachment?.name);
+    const renderedUrl = renderedUrls.find((url) => {
+      let decodedUrl = url;
+      try {
+        decodedUrl = decodeURIComponent(url);
+      } catch {
+        // Keep matching against the encoded URL if decoding fails.
+      }
+      return (id && url.includes(`/${id}/`)) || (filename && decodedUrl.includes(`/${filename}`));
+    });
+    return renderedUrl
+      ? { ...attachment, proxy_url: renderedUrl, proxyUrl: renderedUrl, proxyURL: renderedUrl }
+      : attachment;
+  });
+  return { ...message, attachments };
 }
 
 function markDeleted(id, channelId) {
@@ -658,8 +1098,8 @@ function markDeleted(id, channelId) {
   // action is still in flight, then archive them like any other message.
   if (index === -1) {
     const message =
-      messageFromStore(messageId, asString(channelId)) ||
-      messageFromRenderedDom(messageId, asString(channelId));
+      messageFromRenderedDom(messageId, asString(channelId)) ||
+      messageFromStore(messageId, asString(channelId));
     if (message) {
       rememberMessage({ ...message, channel_id: message.channel_id || channelId });
       pending = pendingMessages.get(messageId);
@@ -676,7 +1116,10 @@ function markDeleted(id, channelId) {
   const candidate = index === -1 ? [...current, archived] : current.map((entry, entryIndex) => (entryIndex === index ? archived : entry));
   const next = trimArchive(candidate);
   store[ARCHIVE_KEY] = next;
-  if (pending) pendingMessageBytes -= archiveEntryBytes(pending);
+  if (pending) {
+    pendingMessageBytes = Math.max(0, pendingMessageBytes - pendingEntryBytes(pending));
+    pendingPhotoBytes = Math.max(0, pendingPhotoBytes - pendingEntryPhotoBytes(pending));
+  }
   pendingMessages.delete(messageId);
   if (next.some((entry) => entry.id === messageId)) cachePhotos(messageId, archived.attachments);
   scheduleArchiveTrim();
@@ -711,8 +1154,9 @@ function handleDispatch(payload) {
   // Allow Alexandria's explicit cleanup action through to Discord's store.
   // Without this marker, the normal delete interceptor would retain it again.
   if (
-    payload.alexandriaRemove &&
-    (payload.type === "MESSAGE_DELETE" || payload.type === "MESSAGE_DELETE_BULK")
+    (payload.alexandriaRemove &&
+      (payload.type === "MESSAGE_DELETE" || payload.type === "MESSAGE_DELETE_BULK")) ||
+    (payload.alexandriaCompact && payload.type === "MESSAGE_UPDATE")
   ) return;
 
   if (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") {
@@ -724,7 +1168,10 @@ function handleDispatch(payload) {
     const messageId = payload.id || payload.messageId || payload.message?.id;
     const channelId =
       payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId;
-    const snapshot = messageFromStore(asString(messageId), asString(channelId)) || payload.message;
+    const snapshot =
+      messageFromRenderedDom(asString(messageId), asString(channelId)) ||
+      messageFromStore(asString(messageId), asString(channelId)) ||
+      payload.message;
     // A message remembered while it was visible remains eligible even if the
     // delete payload no longer contains enough channel metadata to re-check
     // the selected-scope setting.
@@ -738,7 +1185,8 @@ function handleDispatch(payload) {
     }
     // Keep the red in-chat treatment until the plugin unloads or the bounded
     // session-retention queue evicts this row.
-    retainDeletedMessagePreview(asString(messageId), asString(channelId), snapshot);
+    const compacted = compactRetainedMessage(asString(messageId), asString(channelId), snapshot);
+    retainDeletedMessagePreview(asString(messageId), asString(channelId), compacted);
     return false;
   }
 
@@ -750,13 +1198,17 @@ function handleDispatch(payload) {
       ids.forEach((id) => {
         const messageId = asString(id?.id || id);
         const messageChannelId = asString(id?.channel_id || id?.channelId || channelId);
-        const snapshot = messageFromStore(messageId, messageChannelId) || id?.message;
+        const snapshot =
+          messageFromRenderedDom(messageId, messageChannelId) ||
+          messageFromStore(messageId, messageChannelId) ||
+          id?.message;
         try {
           markDeleted(messageId, messageChannelId);
         } catch {
           // Keep each retained row independent from archive enrichment.
         }
-        retainDeletedMessagePreview(messageId, messageChannelId, snapshot);
+        const compacted = compactRetainedMessage(messageId, messageChannelId, snapshot);
+        retainDeletedMessagePreview(messageId, messageChannelId, compacted);
       });
     }
     // Deleted rows last for the session, but count and estimated encoded plus
@@ -840,7 +1292,7 @@ function captureRenderedMessage(element) {
   if (!element || element.dataset.alexandriaCaptured) return;
   if (store.captureEnabled === false) return;
 
-  const message = messageFromRenderedElement(element);
+  const message = messageWithRenderedAttachmentUrls(messageFromRenderedElement(element), element);
   // Do not mark the element until its fiber has yielded a message. React can
   // briefly render the element before the message props are attached.
   if (!message) return;
@@ -858,7 +1310,7 @@ function captureLoadedMessages() {
   // starting. Scan the rendered DOM directly so messages sent earlier in the
   // session are archived before a later delete event can remove them.
   const elements = document.querySelectorAll(
-    '[id^="message-username-"], [id^="message-content-"], [id^="message-"]',
+    '[id^="message-username-"], [id^="message-content-"], [id^="message-"], img[src*="/attachments/"]',
   );
   elements.forEach(captureRenderedMessage);
 }
@@ -925,12 +1377,15 @@ function removeArchiveEntry(messageId) {
 
   if (entry?.deleted) {
     try {
-      fluxDispatcher?.dispatch?.({
-        type: "MESSAGE_DELETE",
-        channelId: entry.channelId,
-        id: entry.id,
-        alexandriaRemove: true,
-      });
+      if (visibleDeletedMessages.has(entry.id)) releaseDeletedMessage(entry.id, entry.channelId);
+      else {
+        fluxDispatcher?.dispatch?.({
+          type: "MESSAGE_DELETE",
+          channelId: entry.channelId,
+          id: entry.id,
+          alexandriaRemove: true,
+        });
+      }
     } catch {
       // The archive copy can still be removed if Discord's local row already
       // disappeared or its internal store shape changed.
@@ -938,7 +1393,12 @@ function removeArchiveEntry(messageId) {
   }
 
   const next = current.filter((entry) => entry.id !== messageId);
-  if (next.length !== current.length) store[ARCHIVE_KEY] = next;
+  if (next.length !== current.length) {
+    store[ARCHIVE_KEY] = next;
+    void deletePhotoBlobs(entryPhotoKeys(entry)).catch((error) => {
+      console.error("[Alexandria] Could not remove archived photo blobs", error);
+    });
+  }
 }
 
 function removeDuplicateDomIds(element) {
@@ -1050,8 +1510,8 @@ function capturedCount() {
 }
 
 function storageBytes() {
-  // Never stringify the whole store just to show this figure: with a large
-  // photo archive that would briefly allocate another archive-sized string.
+  // Blob sizes are tracked in metadata, so this remains cheap even when the
+  // disk-backed photo archive is large.
   return entries().reduce((total, entry) => total + archiveEntryBytes(entry), 0);
 }
 
@@ -1280,14 +1740,139 @@ function CaptureScopeSettings() {
   );
 }
 
+function repairMissingArchivedPhoto(messageId, attachment) {
+  const repairKey = `${messageId}:${attachmentKey(attachment)}`;
+  if (photoRepairsInFlight.has(repairKey)) return;
+  photoRepairsInFlight.add(repairKey);
+
+  try {
+    const current = entries();
+    const entryIndex = current.findIndex((entry) => entry.id === messageId);
+    if (entryIndex === -1) return;
+    const attachments = current[entryIndex].attachments.map((item) => {
+      if (attachmentKey(item) !== attachmentKey(attachment) || item.blobKey !== attachment.blobKey) {
+        return item;
+      }
+      const { blobKey, cachedBytes, ...metadata } = item;
+      return { ...metadata, photoUnavailable: false };
+    });
+    if (sameJSON(attachments, current[entryIndex].attachments)) return;
+    const next = [...current];
+    next[entryIndex] = { ...next[entryIndex], attachments };
+    store[ARCHIVE_KEY] = next;
+    const repairedAttachment = attachments.find(
+      (item) => attachmentKey(item) === attachmentKey(attachment),
+    );
+    if (repairedAttachment) cachePhotos(messageId, [repairedAttachment]);
+  } finally {
+    photoRepairsInFlight.delete(repairKey);
+  }
+}
+
+function createArchivedPhotoResource(blobKey, onMissing) {
+  const [source, setSource] = createSignal("");
+  const [blob, setBlob] = createSignal(null);
+  const [error, setError] = createSignal(false);
+
+  createEffect(() => {
+    const key = blobKey();
+    let disposed = false;
+    let objectUrl = "";
+    setSource("");
+    setBlob(null);
+    setError(false);
+
+    if (key) {
+      void readPhotoBlob(key)
+        .then((photo) => {
+          if (disposed) return;
+          if (!(photo instanceof Blob)) {
+            setError(true);
+            onMissing?.();
+            return;
+          }
+          objectUrl = URL.createObjectURL(photo);
+          setBlob(photo);
+          setSource(objectUrl);
+        })
+        .catch(() => {
+          if (!disposed) setError(true);
+        });
+    }
+
+    onCleanup(() => {
+      disposed = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    });
+  });
+
+  return { source, blob, error };
+}
+
+function ArchivedPhoto(props) {
+  const [shouldLoad, setShouldLoad] = createSignal(false);
+  let host;
+  let observer;
+  const photo = createArchivedPhotoResource(
+    () => (shouldLoad() ? props.attachment.blobKey : ""),
+    () => repairMissingArchivedPhoto(props.messageId, props.attachment),
+  );
+
+  onMount(() => {
+    if (typeof IntersectionObserver === "undefined") {
+      setShouldLoad(true);
+      return;
+    }
+    observer = new IntersectionObserver(
+      (records) => {
+        if (!records.some((record) => record.isIntersecting)) return;
+        setShouldLoad(true);
+        observer.disconnect();
+      },
+      { rootMargin: "300px" },
+    );
+    observer.observe(host);
+  });
+  onCleanup(() => observer?.disconnect());
+
+  return (
+    <div class="alexandria-photo-loader" ref={host}>
+      <Show
+        when={photo.source()}
+        fallback={
+          <div class="alexandria-extra-item alexandria-photo-status">
+            {photo.error() ? "Archived photo is unavailable." : "Loading archived photo…"}
+          </div>
+        }
+      >
+        <button
+          class="alexandria-photo"
+          type="button"
+          onClick={() => openPhoto(props.attachment, props.messageId)}
+          aria-label={`Enlarge and copy ${props.attachment.filename || "archived photo"}`}
+          title={props.attachment.filename}
+        >
+          <img loading="lazy" decoding="async" src={photo.source()} alt={props.attachment.filename} />
+          <span class="alexandria-photo-hint" aria-hidden="true">Enlarge</span>
+        </button>
+      </Show>
+    </div>
+  );
+}
+
 function PhotoModal(props) {
   const [copyState, setCopyState] = createSignal("idle");
+  const photo = createArchivedPhotoResource(
+    () => props.attachment.blobKey,
+    () => repairMissingArchivedPhoto(props.messageId, props.attachment),
+  );
 
   const handleCopy = async () => {
+    if (!photo.blob()) return;
     setCopyState("copying");
 
     try {
-      await copyPhoto(props.attachment.dataUrl);
+      await copyPhoto(photo.blob());
       setCopyState("copied");
     } catch (error) {
       console.error("[Alexandria] Could not copy archived photo", error);
@@ -1304,9 +1889,18 @@ function PhotoModal(props) {
         </div>
       </ModalHeader>
       <ModalBody>
-        <div class="alexandria-photo-preview">
-          <img src={props.attachment.dataUrl} alt={props.attachment.filename || "Archived photo"} />
-        </div>
+        <Show
+          when={photo.source()}
+          fallback={
+            <div class="alexandria-photo-preview alexandria-photo-status">
+              {photo.error() ? "Archived photo is unavailable." : "Loading archived photo…"}
+            </div>
+          }
+        >
+          <div class="alexandria-photo-preview">
+            <img src={photo.source()} alt={props.attachment.filename || "Archived photo"} />
+          </div>
+        </Show>
         <div class="alexandria-copy-status" role="status" aria-live="polite">
           <Show when={copyState() === "copied"}>Photo copied to your clipboard.</Show>
           <Show when={copyState() === "error"}>Couldn’t copy the photo in this Discord client.</Show>
@@ -1323,7 +1917,7 @@ function PhotoModal(props) {
         <Button
           size={ButtonSizes.MIN}
           onClick={handleCopy}
-          disabled={copyState() === "copying"}
+          disabled={!photo.blob() || copyState() === "copying"}
         >
           {copyState() === "copying" ? "Copying…" : copyState() === "copied" ? "Copied!" : "Copy image"}
         </Button>
@@ -1332,9 +1926,11 @@ function PhotoModal(props) {
   );
 }
 
-function openPhoto(attachment) {
+function openPhoto(attachment, messageId) {
   removePhotoModal?.();
-  removePhotoModal = openModal((props) => <PhotoModal {...props} attachment={attachment} />);
+  removePhotoModal = openModal((props) => (
+    <PhotoModal {...props} attachment={attachment} messageId={messageId} />
+  ));
 }
 
 function ArchiveModal(props) {
@@ -1625,7 +2221,7 @@ function ArchiveModal(props) {
                             fallback={<div class="alexandria-extra-item">↗ {attachment.filename}</div>}
                           >
                             <Show
-                              when={attachment.dataUrl}
+                              when={attachment.blobKey}
                               fallback={
                                 <div class="alexandria-extra-item alexandria-photo-status">
                                   {attachment.photoUnavailable
@@ -1634,16 +2230,7 @@ function ArchiveModal(props) {
                                 </div>
                               }
                             >
-                              <button
-                                class="alexandria-photo"
-                                type="button"
-                                onClick={() => openPhoto(attachment)}
-                                aria-label={`Enlarge and copy ${attachment.filename || "archived photo"}`}
-                                title={attachment.filename}
-                              >
-                                <img src={attachment.dataUrl} alt={attachment.filename} />
-                                <span class="alexandria-photo-hint" aria-hidden="true">Enlarge</span>
-                              </button>
+                              <ArchivedPhoto attachment={attachment} messageId={entry.id} />
                             </Show>
                           </Show>
                         )}
@@ -1700,7 +2287,9 @@ async function clearArchive() {
       confirmText: "Clear archive",
       cancelText: "Keep archive",
     });
+    const archivedPhotoKeys = entries().flatMap(entryPhotoKeys);
     store[ARCHIVE_KEY] = [];
+    await deletePhotoBlobs(archivedPhotoKeys);
   } catch {
     // Closing or cancelling the confirmation leaves the archive untouched.
   }
@@ -1822,6 +2411,10 @@ function mountLauncher() {
 scoped.ui.injectCss(styles);
 
 export function onLoad() {
+  pluginUnloading = false;
+  void prepareMediaDatabase().catch((error) => {
+    console.error("[Alexandria] Could not prepare the photo database", error);
+  });
   // Remove badges left in the DOM by Alexandria versions that predate the
   // MessageLogger-style deleted-message treatment.
   document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
@@ -1833,7 +2426,7 @@ export function onLoad() {
   });
 
   const unobserve = scoped.observeDom(
-    '[id^="message-username-"], [id^="message-content-"]',
+    '[id^="message-username-"], [id^="message-content-"], img[src*="/attachments/"]',
     captureRenderedMessage,
   );
   unobserve.now();
@@ -1901,7 +2494,7 @@ export const settings = () => (
         <span>Storage used</span>
         <strong>{formatBytes(storageBytes())}</strong>
       </div>
-      <p>Approximate persistent data stored by Alexandria, including cached photos. The rolling archive is capped at 2,000 entries or 2 GB.</p>
+      <p>Approximate archive storage, including disk-backed photos. The rolling archive is capped at 2,000 entries or 2 GB; temporary pre-delete photo staging is separately capped at 300 MB.</p>
     </div>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
@@ -1915,15 +2508,38 @@ export const settings = () => (
 );
 
 export function onUnload() {
+  pluginUnloading = true;
   clearTimeout(archiveTrimTimer);
+  photoCaptureQueue.length = 0;
+  queuedPhotoCaptures.clear();
   for (const [messageId, preview] of [...visibleDeletedMessages]) {
     releaseDeletedMessage(messageId, preview.channelId);
   }
   visibleDeletedMessageBytes = 0;
+  const pendingPhotoKeys = [...pendingMessages.values()].flatMap(entryPhotoKeys);
   pendingMessages.clear();
   pendingMessageBytes = 0;
+  pendingPhotoBytes = 0;
   removeModal?.();
   removeModal = undefined;
+  removePhotoModal?.();
+  removePhotoModal = undefined;
+  void (async () => {
+    try {
+      await deletePhotoBlobs(pendingPhotoKeys);
+      while (activePhotoCaptures > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    } catch {
+      // Discord shutdown will close the database even if cleanup is cut short.
+    } finally {
+      try {
+        (await mediaDatabasePromise)?.close();
+      } catch {
+        // The database may never have been opened in a text-only session.
+      }
+    }
+  })();
   launcherHost?.remove();
   launcherHost = undefined;
 }

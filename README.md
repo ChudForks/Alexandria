@@ -5,8 +5,11 @@ Alexandria is a Shelter plugin that preserves messages locally before they are d
 ## Features
 
 - Preserves deleted messages and their locally cached photos in a rolling archive (up to 2,000 entries / 2 GB)
+- Stores archived photos as disk-backed IndexedDB blobs and loads them only near the visible archive viewport
 - Keeps only the latest 250 visible messages (up to 16 MB) in session memory until they are deleted; ordinary messages are not persistently archived
+- Pre-caches visible photos in a bounded 300 MB disk staging area so older signed Discord URLs are captured before deletion
 - Shows deleted messages red until restart, retaining at most 250 rows / an estimated 300 MB at once
+- Replaces retained live media with bounded static previews so Discord can release full-size and animated media memory; originals remain available in the archive
 - Searchable archive with server, direct-message, and user filters
 - Configurable capture scopes for servers and direct messages
 - Vencord MessageLogger-style deleted-message appearance
@@ -39,7 +42,7 @@ Discord's delete event does not include the original message contents, so Alexan
 
 ## Privacy and storage
 
-The archive is stored locally in Shelter's persistent plugin storage. To keep Discord responsive in busy servers, Alexandria retains the newest entries that fit within 2,000 messages and 2 GB; older entries are removed automatically. Cached photos can consume substantially more space than text messages. Live deleted rows use a separate 250-message / estimated 300 MB session cap, including encoded attachment sizes and decoded image surfaces when Discord supplies dimensions.
+Archive metadata is stored in Shelter's persistent plugin storage, while photos are stored separately as IndexedDB blobs and loaded only when viewed. To keep Discord responsive in busy servers, Alexandria retains the newest entries that fit within 2,000 messages and 2 GB; older entries and their photo blobs are removed automatically. Live deleted rows use a separate 250-message / estimated 300 MB session cap, including encoded attachment sizes and decoded image surfaces when Discord supplies dimensions.
 
 ## Development
 
@@ -56,4 +59,4 @@ Build the plugin:
 pnpm lune ci
 ```
 
-Current version: **0.7.4**
+Current version: **0.8.0**
