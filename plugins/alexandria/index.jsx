@@ -30,11 +30,11 @@ const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 // reactive updates grow without bound. This is intentionally a rolling local
 // archive; deleted entries are retained just like ordinary captured entries.
 const MAX_ARCHIVE_ENTRIES = 2_000;
-const MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_PENDING_MESSAGES = 250;
 const MAX_PENDING_BYTES = 16 * 1024 * 1024;
-const MAX_VISIBLE_DELETED_MESSAGES = 100;
-const DELETED_MESSAGE_PREVIEW_MS = 30_000;
+const MAX_VISIBLE_DELETED_MESSAGES = 250;
+const MAX_VISIBLE_DELETED_BYTES = 300 * 1024 * 1024;
 const ARCHIVE_PAGE_SIZE = 100;
 
 store[ARCHIVE_KEY] ??= [];
@@ -71,6 +71,7 @@ let archiveTrimTimer;
 const pendingMessages = new Map();
 let pendingMessageBytes = 0;
 const visibleDeletedMessages = new Map();
+let visibleDeletedMessageBytes = 0;
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
@@ -116,6 +117,25 @@ function archiveEntryBytes(entry) {
   return size;
 }
 
+function liveMessageBytes(message) {
+  const entry = toArchiveEntry(message);
+  let size = entry ? archiveEntryBytes(entry) : 128;
+
+  // Retained Discord rows can keep both the encoded attachment and its
+  // decoded image surface alive. Count both when metadata is available so a
+  // handful of high-resolution images cannot defeat the session memory cap.
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  for (const attachment of attachments) {
+    const encodedBytes = Math.max(0, Number(attachment?.size) || 0);
+    const width = Math.max(0, Number(attachment?.width) || 0);
+    const height = Math.max(0, Number(attachment?.height) || 0);
+    const decodedBytes = Math.min(Number.MAX_SAFE_INTEGER, width * height * 4);
+    size += encodedBytes + decodedBytes;
+  }
+
+  return Math.max(128, size);
+}
+
 function trimArchive(next) {
   // Preserve the most recently active messages, rather than relying on the
   // array order which can differ for migrated archives and message updates.
@@ -146,7 +166,7 @@ function scheduleArchiveTrim() {
 
 function releaseDeletedMessage(messageId, channelId) {
   const preview = visibleDeletedMessages.get(messageId);
-  if (preview) clearTimeout(preview.timer);
+  if (preview) visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - preview.bytes);
   visibleDeletedMessages.delete(messageId);
   fluxDispatcher?.dispatch?.({
     type: "MESSAGE_DELETE",
@@ -156,19 +176,24 @@ function releaseDeletedMessage(messageId, channelId) {
   });
 }
 
-function retainDeletedMessagePreview(messageId, channelId) {
+function retainDeletedMessagePreview(messageId, channelId, message) {
   if (!messageId || !channelId) return;
   const previous = visibleDeletedMessages.get(messageId);
-  if (previous) clearTimeout(previous.timer);
+  if (previous) visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - previous.bytes);
+  const retainedMessage = message || entries().find((entry) => entry.id === messageId);
 
   const preview = {
     channelId,
-    timer: setTimeout(() => releaseDeletedMessage(messageId, channelId), DELETED_MESSAGE_PREVIEW_MS),
+    bytes: liveMessageBytes(retainedMessage),
   };
   visibleDeletedMessages.delete(messageId);
   visibleDeletedMessages.set(messageId, preview);
+  visibleDeletedMessageBytes += preview.bytes;
 
-  while (visibleDeletedMessages.size > MAX_VISIBLE_DELETED_MESSAGES) {
+  while (
+    visibleDeletedMessages.size > MAX_VISIBLE_DELETED_MESSAGES ||
+    visibleDeletedMessageBytes > MAX_VISIBLE_DELETED_BYTES
+  ) {
     const [oldestId, oldest] = visibleDeletedMessages.entries().next().value;
     releaseDeletedMessage(oldestId, oldest.channelId);
   }
@@ -245,6 +270,9 @@ function normaliseAttachment(attachment) {
     url,
     proxyUrl,
     contentType,
+    size: Math.max(0, Number(attachment?.size) || 0),
+    width: Math.max(0, Number(attachment?.width) || 0),
+    height: Math.max(0, Number(attachment?.height) || 0),
     isImage: contentType.startsWith("image/") || Boolean(imageTypeFromFilename(filename)),
   };
 }
@@ -402,6 +430,37 @@ function readBlobAsDataUrl(blob) {
   });
 }
 
+async function readBoundedResponseBlob(response) {
+  const contentLength = Number(response.headers.get("content-length"));
+  if (contentLength && contentLength > MAX_PHOTO_BYTES) return null;
+
+  if (!response.body?.getReader) {
+    const blob = await response.blob();
+    return blob.size <= MAX_PHOTO_BYTES ? blob : null;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_PHOTO_BYTES) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return new Blob(chunks, { type: response.headers.get("content-type") || "" });
+}
+
 function setPhotoCaptureStatus(messageId, key, photoUnavailable) {
   const current = entries();
   const entryIndex = current.findIndex((entry) => entry.id === messageId);
@@ -432,11 +491,10 @@ async function cachePhoto(messageId, attachment) {
 
     for (const sourceUrl of sourceUrls) {
       const response = await fetch(sourceUrl);
-      const contentLength = Number(response.headers.get("content-length"));
-      if (!response.ok || (contentLength && contentLength > MAX_PHOTO_BYTES)) continue;
+      if (!response.ok) continue;
 
-      const candidate = await response.blob();
-      if (candidate.size > MAX_PHOTO_BYTES) continue;
+      const candidate = await readBoundedResponseBlob(response);
+      if (!candidate) continue;
 
       // Discord may serve an image as application/octet-stream. The attachment
       // metadata is still authoritative, so retain it with that image type.
@@ -468,8 +526,9 @@ async function cachePhoto(messageId, attachment) {
 
     const next = [...current];
     next[entryIndex] = { ...next[entryIndex], attachments };
-    store[ARCHIVE_KEY] = next;
-    scheduleArchiveTrim();
+    // Enforce the persistent cap before assigning into the reactive store so
+    // an oversized intermediate archive is never handed to persistence.
+    store[ARCHIVE_KEY] = trimArchive(next);
   } catch {
     // A CDN request can fail after a message is deleted. Keep a visible status
     // instead of presenting the expiring remote link as archived content.
@@ -677,10 +736,9 @@ function handleDispatch(payload) {
       // Archive enrichment is best-effort and must never affect Discord's
       // normal delete processing.
     }
-    // Keep the red in-chat treatment briefly, then explicitly release the
-    // message from Discord's store. This restores the visual cue without the
-    // former session-long memory retention.
-    retainDeletedMessagePreview(asString(messageId), asString(channelId));
+    // Keep the red in-chat treatment until the plugin unloads or the bounded
+    // session-retention queue evicts this row.
+    retainDeletedMessagePreview(asString(messageId), asString(channelId), snapshot);
     return false;
   }
 
@@ -689,19 +747,20 @@ function handleDispatch(payload) {
     const channelId = payload.channel_id || payload.channelId;
     if (!shouldCaptureMessage(null, channelId)) return;
     if (Array.isArray(ids)) {
-      try {
-        ids.forEach((id) => markDeleted(id?.id || id, id?.channel_id || id?.channelId || channelId));
-      } catch {
-        // Keep bulk retention independent from archive enrichment too.
-      }
       ids.forEach((id) => {
         const messageId = asString(id?.id || id);
         const messageChannelId = asString(id?.channel_id || id?.channelId || channelId);
-        retainDeletedMessagePreview(messageId, messageChannelId);
+        const snapshot = messageFromStore(messageId, messageChannelId) || id?.message;
+        try {
+          markDeleted(messageId, messageChannelId);
+        } catch {
+          // Keep each retained row independent from archive enrichment.
+        }
+        retainDeletedMessagePreview(messageId, messageChannelId, snapshot);
       });
     }
-    // Each retained row has an independent 30-second cleanup timer and the
-    // queue is capped, so bulk deletes cannot accumulate for a whole session.
+    // Deleted rows last for the session, but count and estimated encoded plus
+    // decoded image memory caps keep bulk deletes from growing without bound.
     return false;
   }
 }
@@ -991,12 +1050,9 @@ function capturedCount() {
 }
 
 function storageBytes() {
-  try {
-    const serializedStore = JSON.stringify(store);
-    return serializedStore ? new Blob([serializedStore]).size : 0;
-  } catch {
-    return 0;
-  }
+  // Never stringify the whole store just to show this figure: with a large
+  // photo archive that would briefly allocate another archive-sized string.
+  return entries().reduce((total, entry) => total + archiveEntryBytes(entry), 0);
 }
 
 function formatBytes(bytes) {
@@ -1845,7 +1901,7 @@ export const settings = () => (
         <span>Storage used</span>
         <strong>{formatBytes(storageBytes())}</strong>
       </div>
-      <p>Approximate persistent data stored by Alexandria, including cached photos. The rolling archive is capped at 2,000 entries or 250 MB.</p>
+      <p>Approximate persistent data stored by Alexandria, including cached photos. The rolling archive is capped at 2,000 entries or 2 GB.</p>
     </div>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
@@ -1863,6 +1919,7 @@ export function onUnload() {
   for (const [messageId, preview] of [...visibleDeletedMessages]) {
     releaseDeletedMessage(messageId, preview.channelId);
   }
+  visibleDeletedMessageBytes = 0;
   pendingMessages.clear();
   pendingMessageBytes = 0;
   removeModal?.();

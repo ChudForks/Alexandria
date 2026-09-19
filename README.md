@@ -1,12 +1,12 @@
 # Alexandria
 
-Alexandria is a Shelter plugin that preserves messages locally before they are deleted. It keeps a small, session-only buffer of visible messages, then commits only deleted messages to a searchable rolling archive. Deleted messages remain red in chat briefly, then Discord releases their live memory.
+Alexandria is a Shelter plugin that preserves messages locally before they are deleted. It keeps a small, session-only buffer of visible messages, then commits only deleted messages to a searchable rolling archive. Deleted messages remain red in chat until Discord restarts, subject to bounded session-memory limits.
 
 ## Features
 
-- Preserves deleted messages and their locally cached photos in a rolling archive (up to 2,000 entries / 250 MB)
+- Preserves deleted messages and their locally cached photos in a rolling archive (up to 2,000 entries / 2 GB)
 - Keeps only the latest 250 visible messages (up to 16 MB) in session memory until they are deleted; ordinary messages are not persistently archived
-- Shows deleted messages red in chat for 30 seconds (up to 100 at a time), then releases them automatically
+- Shows deleted messages red until restart, retaining at most 250 rows / an estimated 300 MB at once
 - Searchable archive with server, direct-message, and user filters
 - Configurable capture scopes for servers and direct messages
 - Vencord MessageLogger-style deleted-message appearance
@@ -39,7 +39,7 @@ Discord's delete event does not include the original message contents, so Alexan
 
 ## Privacy and storage
 
-The archive is stored locally in Shelter's persistent plugin storage. To keep Discord responsive in busy servers, Alexandria retains the newest entries that fit within 2,000 messages and 250 MB; older entries are removed automatically. Cached photos can consume substantially more space than text messages.
+The archive is stored locally in Shelter's persistent plugin storage. To keep Discord responsive in busy servers, Alexandria retains the newest entries that fit within 2,000 messages and 2 GB; older entries are removed automatically. Cached photos can consume substantially more space than text messages. Live deleted rows use a separate 250-message / estimated 300 MB session cap, including encoded attachment sizes and decoded image surfaces when Discord supplies dimensions.
 
 ## Development
 
@@ -56,4 +56,4 @@ Build the plugin:
 pnpm lune ci
 ```
 
-Current version: **0.7.3**
+Current version: **0.7.4**
