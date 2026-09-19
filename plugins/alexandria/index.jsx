@@ -31,6 +31,7 @@ const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 // archive; deleted entries are retained just like ordinary captured entries.
 const MAX_ARCHIVE_ENTRIES = 2_000;
 const MAX_ARCHIVE_BYTES = 250 * 1024 * 1024;
+const MAX_PENDING_MESSAGES = 2_000;
 const ARCHIVE_PAGE_SIZE = 100;
 
 store[ARCHIVE_KEY] ??= [];
@@ -64,6 +65,7 @@ const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
 let activePhotoCaptures = 0;
 let archiveTrimTimer;
+const pendingMessages = new Map();
 
 const entries = () => (Array.isArray(store[ARCHIVE_KEY]) ? store[ARCHIVE_KEY] : []);
 const fluxStores = shelter.flux?.storesFlat || {};
@@ -471,31 +473,8 @@ function backfillArchivedPhotos() {
   entries().forEach((entry) => cachePhotos(entry.id, entry.attachments || []));
 }
 
-function saveMessage(message) {
-  if (!shouldCaptureMessage(message)) return false;
-
-  const incoming = toArchiveEntry(message);
-  if (!incoming) return false;
-
-  const current = entries();
-  const index = current.findIndex((entry) => entry.id === incoming.id);
-
-  if (index === -1) {
-    const candidate = [...current, { ...incoming, deleted: false, deletedAt: null }];
-    // Count trimming is immediate. Byte trimming is debounced below so a busy
-    // channel does not repeatedly scan and sort the entire archive per event.
-    const next = candidate.length > MAX_ARCHIVE_ENTRIES ? trimArchive(candidate) : candidate;
-    store[ARCHIVE_KEY] = next;
-    scheduleArchiveTrim();
-    // A newly added entry can be evicted immediately when an imported archive
-    // contains timestamps in the future. Do not download media for an entry
-    // that is no longer retained.
-    if (next.some((entry) => entry.id === incoming.id)) cachePhotos(incoming.id, incoming.attachments);
-    return true;
-  }
-
-  const previous = current[index];
-  const updated = {
+function mergeArchiveEntry(previous, incoming) {
+  return {
     ...previous,
     ...incoming,
     // MESSAGE_UPDATE payloads are often partial. Preserve richer data already captured.
@@ -507,19 +486,21 @@ function saveMessage(message) {
     guildName: incoming.guildName || previous.guildName || "",
     directMessageName: incoming.directMessageName || previous.directMessageName || "",
     channelName: incoming.channelName || previous.channelName || "",
-    deleted: previous.deleted === true,
-    deletedAt: previous.deletedAt || null,
   };
+}
 
-  if (sameJSON(previous, updated)) {
-    cachePhotos(incoming.id, updated.attachments);
-    return true;
-  }
+function rememberMessage(message) {
+  if (!shouldCaptureMessage(message)) return false;
 
-  const next = [...current];
-  next[index] = updated;
-  store[ARCHIVE_KEY] = next;
-  cachePhotos(incoming.id, updated.attachments);
+  const incoming = toArchiveEntry(message);
+  if (!incoming) return false;
+
+  const previous = pendingMessages.get(incoming.id);
+  const remembered = previous ? mergeArchiveEntry(previous, incoming) : incoming;
+  // Map insertion order makes eviction inexpensive and bounds live memory.
+  pendingMessages.delete(incoming.id);
+  pendingMessages.set(incoming.id, remembered);
+  while (pendingMessages.size > MAX_PENDING_MESSAGES) pendingMessages.delete(pendingMessages.keys().next().value);
   return true;
 }
 
@@ -568,6 +549,7 @@ function markDeleted(id, channelId) {
   const messageId = asString(id);
   let current = entries();
   let index = current.findIndex((entry) => entry.id === messageId);
+  let pending = pendingMessages.get(messageId);
 
   // Messages sent before plugin startup do not have a MESSAGE_CREATE event for
   // Alexandria to observe. Recover them from Discord's store while the delete
@@ -577,22 +559,25 @@ function markDeleted(id, channelId) {
       messageFromStore(messageId, asString(channelId)) ||
       messageFromRenderedDom(messageId, asString(channelId));
     if (message) {
-      saveMessage({ ...message, channel_id: message.channel_id || channelId });
-      current = entries();
-      index = current.findIndex((entry) => entry.id === messageId);
+      rememberMessage({ ...message, channel_id: message.channel_id || channelId });
+      pending = pendingMessages.get(messageId);
     }
   }
 
-  if (index === -1) return false;
-  if (current[index].deleted) return true;
+  if (index === -1 && !pending) return false;
+  if (index !== -1 && current[index].deleted) return true;
 
-  const next = [...current];
-  next[index] = {
-    ...next[index],
-    deleted: true,
-    deletedAt: new Date().toISOString(),
-  };
+  const previous = index === -1 ? null : current[index];
+  const archived = previous
+    ? { ...mergeArchiveEntry(previous, pending || previous), deleted: true, deletedAt: new Date().toISOString() }
+    : { ...pending, deleted: true, deletedAt: new Date().toISOString() };
+  const candidate = index === -1 ? [...current, archived] : current.map((entry, entryIndex) => (entryIndex === index ? archived : entry));
+  const next = trimArchive(candidate);
   store[ARCHIVE_KEY] = next;
+  pendingMessages.delete(messageId);
+  if (next.some((entry) => entry.id === messageId)) cachePhotos(messageId, archived.attachments);
+  scheduleArchiveTrim();
+
   markDeletedMessageAfterRender(messageId, asString(channelId));
   return true;
 }
@@ -628,7 +613,7 @@ function handleDispatch(payload) {
   ) return;
 
   if (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") {
-    saveMessage(messageFromPayload(payload));
+    rememberMessage(messageFromPayload(payload));
     return;
   }
 
@@ -637,7 +622,10 @@ function handleDispatch(payload) {
     const channelId =
       payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId;
     const snapshot = messageFromStore(asString(messageId), asString(channelId)) || payload.message;
-    if (!shouldCaptureMessage(snapshot, channelId)) return;
+    // A message remembered while it was visible remains eligible even if the
+    // delete payload no longer contains enough channel metadata to re-check
+    // the selected-scope setting.
+    if (!shouldCaptureMessage(snapshot, channelId) && !pendingMessages.has(asString(messageId))) return;
 
     try {
       markDeleted(messageId, channelId);
@@ -747,7 +735,7 @@ function captureRenderedMessage(element) {
   // Do not mark the element until its fiber has yielded a message. React can
   // briefly render the element before the message props are attached.
   if (!message) return;
-  if (!saveMessage(message)) return;
+  if (!rememberMessage(message)) return;
   element.dataset.alexandriaCaptured = "1";
 
   const archived = entries().find((entry) => entry.id === asString(message.id));
@@ -775,7 +763,7 @@ async function captureSentMessage(request, send) {
   const responseMessage = messageFromPayload(response?.body);
 
   if (responseMessage) {
-    saveMessage({
+    rememberMessage({
       ...responseMessage,
       channel_id: responseMessage.channel_id || channelIdFromUrl(request?.url),
     });
@@ -1450,7 +1438,7 @@ function ArchiveModal(props) {
               Deleted
             </button>
             <button classList={{ active: showAll() }} type="button" onClick={() => setShowAll(true)}>
-              All captured
+              All archived
             </button>
           </div>
           <span class="alexandria-result-count">

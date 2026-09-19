@@ -1,10 +1,11 @@
 # Alexandria
 
-Alexandria is a Shelter plugin that preserves messages locally before they are deleted. It stores a searchable, rolling archive in Shelter's plugin storage without retaining deleted messages in Discord's live memory.
+Alexandria is a Shelter plugin that preserves messages locally before they are deleted. It keeps a small, session-only buffer of visible messages, then commits only deleted messages to a searchable rolling archive—without retaining deleted messages in Discord's live memory.
 
 ## Features
 
 - Preserves deleted messages and their locally cached photos in a rolling archive (up to 2,000 entries / 250 MB)
+- Keeps only the latest 2,000 visible messages in session memory until they are deleted; ordinary messages are not persistently archived
 - Searchable archive with server, direct-message, and user filters
 - Configurable capture scopes for servers and direct messages
 - Vencord MessageLogger-style deleted-message appearance
@@ -54,4 +55,4 @@ Build the plugin:
 pnpm lune ci
 ```
 
-Current version: **0.7.1**
+Current version: **0.7.2**
