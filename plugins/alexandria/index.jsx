@@ -26,18 +26,31 @@ const {
 const ARCHIVE_KEY = "entries";
 const ARCHIVE_SCHEMA_VERSION = 2;
 const MEDIA_DATABASE_NAME = "alexandria-media";
-const MEDIA_DATABASE_VERSION = 1;
+const MEDIA_DATABASE_VERSION = 2;
 const MEDIA_STORE_NAME = "photos";
+const HISTORY_STORE_NAME = "experimental-history";
 const launcherId = "alexandria-launcher-host";
 const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
+const MAX_PHOTO_CAPTURE_QUEUE = 512;
+const PHOTO_CAPTURE_TIMEOUT_MS = 20_000;
 // Keeping every message in a busy server makes the persisted store and its
 // reactive updates grow without bound. This is intentionally a rolling local
 // archive; deleted entries are retained just like ordinary captured entries.
 const MAX_ARCHIVE_ENTRIES = 2_000;
 const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_METADATA_BYTES = 16 * 1024 * 1024;
+const MAX_EDIT_REVISIONS = 25;
+const MAX_EDIT_HISTORY_BYTES = 128 * 1024;
+const MAX_REMOVED_ATTACHMENTS = 50;
 const MAX_PENDING_MESSAGES = 250;
 const MAX_PENDING_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_PHOTO_BYTES = 300 * 1024 * 1024;
+const MAX_HISTORY_MESSAGES = 2_000;
+const MAX_HISTORY_BYTES = 16 * 1024 * 1024;
+const HISTORY_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const HISTORY_PRELOAD_BATCH_SIZE = 20;
+const HISTORY_PRELOAD_INTERVAL_MS = 1_000;
+const HISTORY_PRELOAD_REFRESH_MS = 5 * 60 * 1_000;
 const MAX_VISIBLE_DELETED_MESSAGES = 250;
 const MAX_VISIBLE_DELETED_BYTES = 300 * 1024 * 1024;
 const MAX_LIVE_IMAGE_EDGE = 512;
@@ -54,6 +67,13 @@ if (store.archiveSchemaVersion !== ARCHIVE_SCHEMA_VERSION) {
   store.archiveSchemaVersion = ARCHIVE_SCHEMA_VERSION;
 }
 store.captureEnabled ??= true;
+store.ignoreBots ??= false;
+store.ignoreSelf ??= false;
+store.ignoredUserIds ??= [];
+store.ignoredChannelIds ??= [];
+store.ignoredGuildIds ??= [];
+store.logEdits ??= true;
+store.logDeletedAttachments ??= true;
 store.captureMode ??= "all";
 store.selectedGuildIds ??= [];
 store.selectedDirectMessageIds ??= [];
@@ -71,6 +91,7 @@ store.serverFilter ??= "";
 store.userFilter ??= "";
 store.directMessageFilter ??= "";
 store.photoBackfillEnabled ??= false;
+store.experimentalHistoryEnabled ??= false;
 store.launcherPosition ??= null;
 
 let launcherHost;
@@ -79,6 +100,7 @@ let removePhotoModal;
 let stopLauncherDrag;
 let suppressLauncherClick = false;
 const photoCapturesInFlight = new Set();
+const photoCaptureControllers = new Map();
 const photoRepairsInFlight = new Set();
 const queuedPhotoCaptures = new Set();
 const photoCaptureQueue = [];
@@ -87,8 +109,28 @@ let archiveTrimTimer;
 let mediaDatabasePromise;
 let mediaReadyPromise;
 let pluginUnloading = false;
+let archiveClearing = false;
 let livePreviewWork = Promise.resolve();
+let historyWork = Promise.resolve();
+let historyReadyPromise;
+let historyGeneration = 0;
+let historyLoaded = false;
+let historyMessageBytes = 0;
+let historyCaptureRevision = 0;
+let historyPreloadTimer;
+let historyPreloadGeneration = 0;
+let historyPreloadActive = false;
+let historyPreloadCursor = 0;
+let historyPreloadNotBefore = 0;
+let historyPreloadQueue = [];
+let historyWriteScheduled = false;
+const historyMessages = new Map();
+const forgottenHistoryIds = new Set();
+const dirtyHistoryIds = new Set();
+const historyPreloadRequests = new WeakSet();
+const historyResponseContexts = new WeakMap();
 const pendingMessages = new Map();
+const archiveCaptureRevisions = new Map();
 let pendingMessageBytes = 0;
 let pendingPhotoBytes = 0;
 const visibleDeletedMessages = new Map();
@@ -106,10 +148,20 @@ function mediaDatabase() {
       if (!database.objectStoreNames.contains(MEDIA_STORE_NAME)) {
         database.createObjectStore(MEDIA_STORE_NAME);
       }
+      if (!database.objectStoreNames.contains(HISTORY_STORE_NAME)) {
+        database.createObjectStore(HISTORY_STORE_NAME);
+      }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      database.onversionchange = () => database.close();
+      resolve(database);
+    };
     request.onerror = () => reject(request.error);
-    request.onblocked = () => reject(new Error("Alexandria media database is blocked."));
+    // A Lune reload can open the upgraded database before the old instance's
+    // asynchronous photo cleanup closes its connection. Let the open request
+    // resume when that connection closes instead of failing the whole session.
+    request.onblocked = () => console.warn("[Alexandria] Waiting for another Discord window to release the local database.");
   });
   return mediaDatabasePromise;
 }
@@ -158,6 +210,19 @@ function entryPhotoKeys(entry) {
   return (entry?.attachments || []).map((attachment) => attachment.blobKey).filter(Boolean);
 }
 
+function removeReplacedPhotoBlobs(previous, next) {
+  const retainedKeys = new Set(entryPhotoKeys(next));
+  const removedKeys = entryPhotoKeys(previous).filter((key) => !retainedKeys.has(key));
+  void deletePhotoBlobs(removedKeys).catch((error) => {
+    console.error("[Alexandria] Could not remove replaced photo blobs", error);
+  });
+}
+
+function photoCaptureAttachment(messageId, key) {
+  const entry = entries().find((item) => item.id === messageId) || pendingMessages.get(messageId);
+  return entry?.attachments?.find((attachment) => attachmentKey(attachment) === key);
+}
+
 function prepareMediaDatabase() {
   mediaReadyPromise ??= (async () => {
     const database = await mediaDatabase();
@@ -169,12 +234,395 @@ function prepareMediaDatabase() {
   return mediaReadyPromise;
 }
 
+function queueHistoryWork(work) {
+  historyWork = historyWork.then(work).catch((error) => {
+    console.error("[Alexandria] Experimental history cache failed", error);
+  });
+  return historyWork;
+}
+
+function historyCaptureEnabled() {
+  return store.experimentalHistoryEnabled === true && store.captureEnabled !== false;
+}
+
+function trimHistoryCache() {
+  const removed = [];
+  const cutoff = Date.now() - HISTORY_RETENTION_MS;
+  for (const [id, record] of historyMessages) {
+    if (
+      record.seenAt > cutoff &&
+      historyMessages.size <= MAX_HISTORY_MESSAGES &&
+      historyMessageBytes <= MAX_HISTORY_BYTES
+    ) break;
+    historyMessages.delete(id);
+    historyMessageBytes = Math.max(0, historyMessageBytes - pendingEntryBytes(record.entry));
+    removed.push(id);
+  }
+  return removed;
+}
+
+function initializeHistoryCache() {
+  if (store.experimentalHistoryEnabled !== true) return Promise.resolve();
+  if (historyReadyPromise) return historyReadyPromise;
+  const generation = historyGeneration;
+  historyReadyPromise = queueHistoryWork(async () => {
+    const database = await mediaDatabase();
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readonly");
+    const records = await requestResult(transaction.objectStore(HISTORY_STORE_NAME).getAll());
+    // Finish hydration even during unload so any queued captures are merged
+    // with disk history and trimmed before the final write/connection close.
+    if (generation !== historyGeneration || store.experimentalHistoryEnabled !== true) return;
+
+    const cutoff = Date.now() - HISTORY_RETENTION_MS;
+    const archivedIds = new Set(entries().filter((entry) => entry.deleted).map((entry) => entry.id));
+    const discarded = [];
+    // Capture may already have started while IndexedDB was opening. Keep the
+    // fresher in-session version instead of overwriting it with disk history.
+    const combined = new Map(historyMessages);
+    for (const record of records) {
+      if (!record?.entry?.id || !record.entry.channelId) continue;
+      const id = record.entry.id;
+      if (!Number.isFinite(record.seenAt) || record.seenAt <= cutoff || archivedIds.has(id) || forgottenHistoryIds.has(id)) {
+        discarded.push(id);
+        continue;
+      }
+      if ((combined.get(id)?.seenAt || 0) < record.seenAt) combined.set(id, { ...record, revision: 0 });
+    }
+    historyMessages.clear();
+    historyMessageBytes = 0;
+    [...combined.values()].sort((a, b) => a.seenAt - b.seenAt).forEach((record) => {
+      if (archivedIds.has(record.entry.id) || forgottenHistoryIds.has(record.entry.id)) return;
+      historyMessages.set(record.entry.id, record);
+      historyMessageBytes += pendingEntryBytes(record.entry);
+    });
+    discarded.push(...trimHistoryCache());
+    historyLoaded = true;
+    forgottenHistoryIds.clear();
+    if (discarded.length) {
+      const cleanup = database.transaction(HISTORY_STORE_NAME, "readwrite");
+      const snapshots = cleanup.objectStore(HISTORY_STORE_NAME);
+      discarded.filter((id) => !historyMessages.has(id)).forEach((id) => snapshots.delete(id));
+      await transactionComplete(cleanup);
+    }
+  });
+  return historyReadyPromise;
+}
+
+function rememberHistoryEntry(entry, revision = ++historyCaptureRevision) {
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing || !entry?.id) return;
+  initializeHistoryCache();
+  // Keep only text and attachment metadata here. The existing photo staging
+  // budget remains independent; history must not retain expired blob keys.
+  const snapshot = {
+    ...entry,
+    attachments: (entry.attachments || []).map(({ blobKey, cachedBytes, photoUnavailable, ...metadata }) => metadata),
+  };
+  const previous = historyMessages.get(entry.id);
+  if (previous) historyMessageBytes -= pendingEntryBytes(previous.entry);
+  const record = { entry: snapshot, seenAt: Date.now(), revision };
+  historyMessages.delete(entry.id);
+  historyMessages.set(entry.id, record);
+  historyMessageBytes += pendingEntryBytes(snapshot);
+  const removed = trimHistoryCache();
+  dirtyHistoryIds.add(entry.id);
+  removed.forEach((id) => dirtyHistoryIds.add(id));
+  scheduleHistoryWrites();
+}
+
+function scheduleHistoryWrites() {
+  if (historyWriteScheduled || !dirtyHistoryIds.size) return;
+  historyWriteScheduled = true;
+  const generation = historyGeneration;
+  queueHistoryWork(async () => {
+    if (generation !== historyGeneration || store.experimentalHistoryEnabled !== true) return;
+    const database = await mediaDatabase();
+    if (generation !== historyGeneration || store.experimentalHistoryEnabled !== true) return;
+    historyWriteScheduled = false;
+    const ids = [...dirtyHistoryIds];
+    dirtyHistoryIds.clear();
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readwrite");
+    const snapshots = transaction.objectStore(HISTORY_STORE_NAME);
+    ids.forEach((id) => {
+      const record = historyMessages.get(id);
+      if (record) snapshots.put(record, id);
+      else snapshots.delete(id);
+    });
+    await transactionComplete(transaction);
+  });
+}
+
+function historyEntry(messageId) {
+  if (!historyCaptureEnabled()) return null;
+  const record = historyMessages.get(messageId);
+  if (!record) return null;
+  if (record.seenAt <= Date.now() - HISTORY_RETENTION_MS) {
+    forgetHistoryEntry(messageId);
+    return null;
+  }
+  return record.entry;
+}
+
+function forgetHistoryEntry(messageId) {
+  const record = historyMessages.get(messageId);
+  if (record) historyMessageBytes = Math.max(0, historyMessageBytes - pendingEntryBytes(record.entry));
+  historyMessages.delete(messageId);
+  if (store.experimentalHistoryEnabled !== true) return;
+  if (!historyLoaded) forgottenHistoryIds.add(messageId);
+  dirtyHistoryIds.add(messageId);
+  scheduleHistoryWrites();
+}
+
+function clearHistoryCache() {
+  historyGeneration += 1;
+  historyReadyPromise = undefined;
+  historyLoaded = false;
+  historyMessages.clear();
+  forgottenHistoryIds.clear();
+  dirtyHistoryIds.clear();
+  historyWriteScheduled = false;
+  historyMessageBytes = 0;
+  return queueHistoryWork(async () => {
+    const database = await mediaDatabase();
+    const transaction = database.transaction(HISTORY_STORE_NAME, "readwrite");
+    transaction.objectStore(HISTORY_STORE_NAME).clear();
+    await transactionComplete(transaction);
+  });
+}
+
+function recoverHistoryDeletion(messageId, channelId) {
+  if (!historyCaptureEnabled() || historyLoaded) return;
+  const generation = historyGeneration;
+  void initializeHistoryCache().then(() => {
+    if (generation !== historyGeneration || pluginUnloading || archiveClearing) return;
+    const snapshot = historyEntry(messageId);
+    if (snapshot && shouldCaptureMessage(snapshot, channelId)) markDeleted(messageId, channelId);
+  }).catch((error) => console.error("[Alexandria] Could not archive a cached history message", error));
+}
+
+function captureHistoryMessages(messages, fallbackChannelId = "", revisionBeforeRequest = Infinity) {
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing || !Array.isArray(messages)) return;
+  // History endpoints return newest first. Keep the newest snapshots when a
+  // page exceeds the history budget, without evicting the live/photo buffer.
+  messages.slice().reverse().forEach((message) => {
+    if (!message?.id || entries().some((entry) => entry.id === asString(message.id))) return;
+    // A history response may have been assembled before an edit that arrived
+    // while its request was in flight. Don't replace the newer live snapshot.
+    if ((historyMessages.get(asString(message.id))?.revision || 0) > revisionBeforeRequest) return;
+    const previous = pendingMessages.get(asString(message.id)) || historyEntry(asString(message.id));
+    const incoming = { ...message, channel_id: message.channel_id || message.channelId || fallbackChannelId };
+    if (!shouldCaptureMessage(incoming, previous?.channelId)) return;
+    const entry = toArchiveEntry(incoming, previous);
+    if (entry) rememberHistoryEntry(previous ? mergeArchiveEntry(previous, entry) : entry);
+  });
+}
+
+function isCurrentHistoryResponse(context) {
+  return context.enabled && context.ok && !context.preload &&
+    context.generation === historyGeneration && context.preloadGeneration === historyPreloadGeneration;
+}
+
+function captureHistoryLoadMessages(messages, fallbackChannelId = "") {
+  if (!Array.isArray(messages)) return;
+  const responseContext = historyResponseContexts.get(messages);
+  if (responseContext && !isCurrentHistoryResponse(responseContext)) return;
+  // Discord dispatches the HTTP response again, sometimes through a copied
+  // array. Keep its request boundary on both the array and individual objects.
+  messages.slice().reverse().forEach((message) => {
+    const context = historyResponseContexts.get(message) || responseContext;
+    if (context && !isCurrentHistoryResponse(context)) return;
+    // Unattributed loads can seed unseen/disk-only history, but cannot replace
+    // a live snapshot whose edit may have arrived during the unknown request.
+    captureHistoryMessages([message], fallbackChannelId, context?.revisionBeforeRequest ?? 0);
+  });
+}
+
+async function captureHistoryResponse(request, send) {
+  const context = {
+    generation: historyGeneration,
+    preloadGeneration: historyPreloadGeneration,
+    enabled: historyCaptureEnabled(),
+    revisionBeforeRequest: historyCaptureRevision,
+    preload: historyPreloadRequests.has(request),
+  };
+  const response = await send(request);
+  context.ok = response?.ok !== false;
+  if (Array.isArray(response?.body)) {
+    historyResponseContexts.set(response.body, context);
+    response.body.forEach((message) => {
+      if (message && typeof message === "object") historyResponseContexts.set(message, context);
+    });
+  }
+  // The preloader owns its responses so a source deselected mid-request cannot
+  // slip through the passive interceptor (including while All is selected).
+  if (isCurrentHistoryResponse(context)) {
+    try {
+      captureHistoryMessages(response?.body, channelIdFromUrl(request?.url), context.revisionBeforeRequest);
+    } catch (error) {
+      console.error("[Alexandria] Could not capture loaded history", error);
+    }
+  }
+  return response;
+}
+
+function historyPreloadChannels() {
+  if (store.captureMode !== "selected") return [];
+  const channelStore = fluxStores.ChannelStore;
+  const channels = new Map();
+  const visited = new Set();
+  const addChannel = (candidate, guildId, depth = 0) => {
+    if (!candidate || depth > 5) return;
+    if (typeof candidate === "string") {
+      addChannel(channelStore?.getChannel?.(candidate), guildId, depth + 1);
+      return;
+    }
+    if (typeof candidate !== "object" || visited.has(candidate)) return;
+    visited.add(candidate);
+    if (candidate.channel) addChannel(candidate.channel, guildId, depth + 1);
+    if (candidate.id) {
+      const id = asString(candidate.id);
+      const sourceGuildId = asString(candidate.guild_id || candidate.guildId);
+      const type = Number(candidate.type);
+      if (sourceGuildId !== guildId || !/^\d+$/.test(id)) return;
+      if (!(guildId ? [0, 5, 10, 11, 12] : [1, 3]).includes(type)) return;
+      try {
+        const permissions = fluxStores.PermissionStore;
+        if (guildId && permissions?.can &&
+          (!permissions.can(1024n, candidate) || !permissions.can(65536n, candidate))) return;
+      } catch {
+        // If this Discord build's permission API differs, don't probe a
+        // channel whose visibility/history permission cannot be established.
+        return;
+      }
+      channels.set(id, { id, guildId });
+      return;
+    }
+    if (candidate instanceof Map || candidate instanceof Set) {
+      candidate.forEach((item) => addChannel(item, guildId, depth + 1));
+    } else {
+      Object.values(candidate).forEach((item) => addChannel(item, guildId, depth + 1));
+    }
+  };
+  storedIdList("selectedGuildIds").forEach((guildId) => {
+    try {
+      addChannel(channelStore?.getMutableGuildChannelsForGuild?.(guildId), guildId);
+      addChannel(channelStore?.getGuildChannels?.(guildId), guildId);
+      addChannel(fluxStores.GuildChannelStore?.getChannels?.(guildId), guildId);
+    } catch {
+      // Passive history capture still works if channel enumeration changes.
+    }
+  });
+  storedIdList("selectedDirectMessageIds").forEach((id) => {
+    addChannel(channelStore?.getChannel?.(id), "");
+  });
+  return [...channels.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function stopHistoryPreload() {
+  historyPreloadGeneration += 1;
+  clearTimeout(historyPreloadTimer);
+  historyPreloadTimer = undefined;
+  historyPreloadQueue = [];
+}
+
+function scheduleHistoryPreload(delay = 0) {
+  clearTimeout(historyPreloadTimer);
+  historyPreloadTimer = undefined;
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing || historyPreloadActive) return;
+  historyPreloadTimer = setTimeout(preloadHistoryChannel, Math.max(delay, historyPreloadNotBefore - Date.now()));
+}
+
+async function preloadHistoryChannel() {
+  historyPreloadTimer = undefined;
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing || historyPreloadActive) return;
+  trimHistoryCache().forEach((id) => dirtyHistoryIds.add(id));
+  scheduleHistoryWrites();
+  if (!historyPreloadQueue.length) {
+    const channels = historyPreloadChannels();
+    if (!channels.length) {
+      scheduleHistoryPreload(HISTORY_PRELOAD_REFRESH_MS);
+      return;
+    }
+    historyPreloadCursor %= channels.length;
+    const count = Math.min(channels.length, HISTORY_PRELOAD_BATCH_SIZE);
+    historyPreloadQueue = Array.from({ length: count }, (_, index) => channels[(historyPreloadCursor + index) % channels.length]);
+    historyPreloadCursor = (historyPreloadCursor + count) % channels.length;
+  }
+  const channel = historyPreloadQueue.shift();
+  const generation = historyGeneration;
+  const preloadGeneration = historyPreloadGeneration;
+  const revisionBeforeRequest = historyCaptureRevision;
+  let delay = HISTORY_PRELOAD_INTERVAL_MS;
+  historyPreloadActive = true;
+  try {
+    await shelter.http?.ready;
+    if (!historyCaptureEnabled() || pluginUnloading || archiveClearing || preloadGeneration !== historyPreloadGeneration) return;
+    const request = { url: `/channels/${channel.id}/messages`, query: { limit: 100 }, retries: 0 };
+    historyPreloadRequests.add(request);
+    const response = await shelter.http.get(request);
+    if (generation === historyGeneration && preloadGeneration === historyPreloadGeneration && response?.ok !== false) {
+      const messages = Array.isArray(response?.body) ? response.body.slice(0, 100) : [];
+      captureHistoryMessages(messages.map((message) => ({ ...message, channel_id: channel.id, guild_id: channel.guildId })), channel.id, revisionBeforeRequest);
+    }
+    if (response?.status === 429) {
+      delay = Math.max(HISTORY_PRELOAD_REFRESH_MS, (Number(response.body?.retry_after) || 0) * 1_000);
+      historyPreloadQueue = [];
+    }
+  } catch (error) {
+    // Forbidden/missing channels and network failures are best-effort misses,
+    // not reasons to interfere with Discord's normal requests or retry rapidly.
+    const status = error?.status || error?.response?.status;
+    if (status === 429) {
+      delay = Math.max(HISTORY_PRELOAD_REFRESH_MS, (Number(error.body?.retry_after || error.response?.body?.retry_after) || 0) * 1_000);
+      historyPreloadQueue = [];
+    }
+  } finally {
+    historyPreloadActive = false;
+    const nextDelay = preloadGeneration !== historyPreloadGeneration || historyPreloadQueue.length
+      ? delay : Math.max(delay, HISTORY_PRELOAD_REFRESH_MS);
+    historyPreloadNotBefore = Math.max(historyPreloadNotBefore, Date.now() + nextDelay);
+    scheduleHistoryPreload(nextDelay);
+  }
+}
+
+function captureLoadedHistory() {
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing) return;
+  const channelIds = new Set([selectedChannelId(), ...historyPreloadChannels().map((channel) => channel.id)]);
+  channelIds.forEach((channelId) => {
+    try {
+      const collection = fluxStores.MessageStore?.getMessages?.(channelId);
+      const messages = Array.isArray(collection) ? collection : collection?.toArray?.() || collection?._array || [];
+      captureHistoryMessages(messages, channelId);
+    } catch {
+      // The HTTP interceptor and DOM path cover incompatible store collections.
+    }
+  });
+}
+
+function refreshHistoryCapture() {
+  stopHistoryPreload();
+  historyPreloadCursor = 0;
+  if (!historyCaptureEnabled() || pluginUnloading || archiveClearing) return;
+  initializeHistoryCache();
+  pendingMessages.forEach((entry) => rememberHistoryEntry(entry));
+  captureLoadedHistory();
+  scheduleHistoryPreload();
+}
+
+function setExperimentalHistoryEnabled(value) {
+  store.experimentalHistoryEnabled = Boolean(value);
+  if (store.experimentalHistoryEnabled) refreshHistoryCapture();
+  else {
+    stopHistoryPreload();
+    void clearHistoryCache();
+  }
+}
+
 function asString(value, fallback = "") {
   return value === undefined || value === null ? fallback : String(value);
 }
 
 function archiveActivityTime(entry) {
-  return Date.parse(entry.deletedAt || entry.timestamp) || 0;
+  return Date.parse(entry.deletedAt || entry.editedAt || entry.timestamp) || 0;
 }
 
 function archiveEntryBytes(entry) {
@@ -194,7 +642,12 @@ function archiveEntryBytes(entry) {
     entry.content,
     entry.timestamp,
     entry.deletedAt,
+    entry.editedAt,
   ].reduce((total, value) => total + textBytes(value), 128);
+
+  for (const revision of entry.editHistory || []) {
+    size += textBytes(revision.content) + textBytes(revision.editedAt) + 32;
+  }
 
   for (const embed of entry.embeds || []) {
     size += textBytes(embed.title) + textBytes(embed.description) + textBytes(embed.url);
@@ -202,6 +655,7 @@ function archiveEntryBytes(entry) {
   for (const attachment of entry.attachments || []) {
     size += textBytes(attachment.id) + textBytes(attachment.filename) + textBytes(attachment.url);
     size += textBytes(attachment.proxyUrl) + textBytes(attachment.contentType);
+    size += textBytes(attachment.removedAt);
     size += Math.max(0, Number(attachment.cachedBytes) || 0);
   }
   return size;
@@ -229,6 +683,7 @@ function discardPendingEntry(entry) {
   if (!entry) return;
   pendingMessageBytes = Math.max(0, pendingMessageBytes - pendingEntryBytes(entry));
   pendingPhotoBytes = Math.max(0, pendingPhotoBytes - pendingEntryPhotoBytes(entry));
+  drainPhotoCaptureQueue();
   void deletePhotoBlobs(entryPhotoKeys(entry)).catch((error) => {
     console.error("[Alexandria] Could not remove pre-delete photo blobs", error);
   });
@@ -326,6 +781,7 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
   if (!preview || pluginUnloading) return;
 
   const archived = entries().find((entry) => entry.id === messageId);
+  if (!archived) return;
   const archivedAttachments = archived?.attachments || [];
   const sourceAttachments = Array.isArray(message?.attachments) ? message.attachments : archivedAttachments;
   const imageAttachments = archivedAttachments.filter((attachment) => attachment.isImage);
@@ -382,7 +838,7 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
     const compacted = {
       id: messageId,
       channel_id: channelId,
-      content: asString(message?.content || archived?.content),
+      content: asString(message?.content ?? archived.content),
       attachments,
       embeds: (Array.isArray(message?.embeds) ? message.embeds : []).map((embed) => ({
         ...embed,
@@ -394,7 +850,7 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
     };
 
     const currentPreview = visibleDeletedMessages.get(messageId);
-    if (!currentPreview || pluginUnloading) return;
+    if (currentPreview !== preview || pluginUnloading || archiveClearing) return;
     (currentPreview.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
     visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - currentPreview.bytes);
     currentPreview.objectUrls = objectUrls.splice(0);
@@ -439,13 +895,17 @@ function trimArchive(next) {
     .slice()
     .sort((left, right) => archiveActivityTime(right) - archiveActivityTime(left));
   let bytes = 0;
+  let metadataBytes = 0;
   const retained = [];
 
   for (const entry of mostRecent) {
     const entryBytes = archiveEntryBytes(entry);
-    if (retained.length >= MAX_ARCHIVE_ENTRIES || bytes + entryBytes > MAX_ARCHIVE_BYTES) continue;
+    const entryMetadataBytes = pendingEntryBytes(entry);
+    if (retained.length >= MAX_ARCHIVE_ENTRIES || bytes + entryBytes > MAX_ARCHIVE_BYTES ||
+      metadataBytes + entryMetadataBytes > MAX_ARCHIVE_METADATA_BYTES) continue;
     retained.push(entry);
     bytes += entryBytes;
+    metadataBytes += entryMetadataBytes;
   }
 
   if (retained.length === next.length) return next;
@@ -476,16 +936,17 @@ function releaseDeletedMessage(messageId, channelId) {
     (preview.objectUrls || []).forEach((url) => URL.revokeObjectURL(url));
   }
   visibleDeletedMessages.delete(messageId);
-  fluxDispatcher?.dispatch?.({
+  return fluxDispatcher?.dispatch?.({
     type: "MESSAGE_DELETE",
     id: messageId,
+    channelId,
     channel_id: channelId,
     alexandriaRemove: true,
   });
 }
 
 function retainDeletedMessagePreview(messageId, channelId, message) {
-  if (!messageId || !channelId) return;
+  if (!messageId || !channelId || !message?.id) return false;
   const previous = visibleDeletedMessages.get(messageId);
   if (previous) {
     visibleDeletedMessageBytes = Math.max(0, visibleDeletedMessageBytes - previous.bytes);
@@ -512,6 +973,7 @@ function retainDeletedMessagePreview(messageId, channelId, message) {
   }
 
   markDeletedMessageAfterRender(messageId, channelId);
+  return visibleDeletedMessages.has(messageId);
 }
 
 // Apply the retention limit on load as well, so an existing large archive is
@@ -651,13 +1113,77 @@ function selectedChannelId() {
   );
 }
 
+function isActiveMessageLocation(message, fallbackChannelId = "") {
+  const { channelId, guildId } = messageLocation(message, fallbackChannelId);
+  if (!channelId) return false;
+
+  // The route is the freshest source during navigation. Retain messages from
+  // any channel in the server currently open; DMs remain exact-conversation
+  // only because they do not share a server-level view.
+  const route = globalThis.location?.pathname?.match?.(/\/channels\/(@me|\d+)\/(\d+)/);
+  if (route?.[1] === "@me") return channelId === route[2];
+  if (route?.[1]) return Boolean(guildId && guildId === route[1]);
+
+  const activeChannelId = selectedChannelId();
+  if (!activeChannelId) return false;
+  if (channelId === activeChannelId) return true;
+
+  const activeChannel = fluxStores.ChannelStore?.getChannel?.(activeChannelId);
+  const activeGuildId = asString(activeChannel?.guild_id || activeChannel?.guildId);
+  return Boolean(guildId && activeGuildId && guildId === activeGuildId);
+}
+
+function shouldIgnoreMessage(message, fallbackChannelId = "") {
+  // Gateway updates may omit author data; archived snapshots retain authorId
+  // and authorBot so the same exclusions also apply to partial edits/deletes.
+  const author = message?.author && typeof message.author === "object" ? message.author : {};
+  const authorId = asString(author.id || message?.author_id || message?.authorId);
+  const authorBot = author.bot ?? message?.authorBot ?? fluxStores.UserStore?.getUser?.(authorId)?.bot;
+  if (store.ignoreBots === true && authorBot === true) return true;
+  if (store.ignoreSelf === true) {
+    const currentUserId = asString(fluxStores.UserStore?.getCurrentUser?.()?.id);
+    if (currentUserId && authorId === currentUserId) return true;
+  }
+
+  const ignoredIds = (key) => new Set(
+    (Array.isArray(store[key]) ? store[key] : asString(store[key]).split(/[\s,]+/))
+      .map((id) => asString(id).trim()).filter(Boolean),
+  );
+  if (authorId && ignoredIds("ignoredUserIds").has(authorId)) return true;
+
+  const guildIds = ignoredIds("ignoredGuildIds");
+  const channelIds = ignoredIds("ignoredChannelIds");
+  if (!guildIds.size && !channelIds.size) return false;
+
+  const { channelId, guildId } = messageLocation(message, fallbackChannelId);
+  if (guildId && guildIds.has(guildId)) return true;
+  let parentId = channelId;
+  const visited = new Set();
+  // Threads inherit their channel exclusion, and channels inherit their
+  // category exclusion. Bound the walk in case Discord's store is incomplete
+  // or contains a malformed parent cycle.
+  for (let depth = 0; parentId && depth < 20 && !visited.has(parentId); depth++) {
+    if (channelIds.has(parentId)) return true;
+    visited.add(parentId);
+    const channel = fluxStores.ChannelStore?.getChannel?.(parentId);
+    const parentGuildId = asString(channel?.guild_id || channel?.guildId);
+    if (parentGuildId && guildIds.has(parentGuildId)) return true;
+    parentId = asString(channel?.parent_id || channel?.parentId);
+  }
+  return false;
+}
+
 function shouldCaptureMessage(message, fallbackChannelId = "") {
   // Capture disabled is always authoritative. Active can add the current
   // server/DM to the saved scope, but never bypasses this global switch.
   if (store.captureEnabled === false) return false;
-
+  if (shouldIgnoreMessage(message, fallbackChannelId)) return false;
   const { channelId, guildId } = messageLocation(message, fallbackChannelId);
   if (!channelId) return false;
+  // Partial updates can omit flags, so also check Discord's loaded original
+  // before treating an ephemeral interaction response as a channel message.
+  const flags = message?.flags ?? messageFromStore(asString(message?.id), channelId)?.flags;
+  if ((Number(flags) & 64) !== 0) return false;
 
   if (store.activeMode === true) {
     const activeChannelId = selectedChannelId();
@@ -686,42 +1212,45 @@ function shouldCaptureMessage(message, fallbackChannelId = "") {
   return true;
 }
 
-function toArchiveEntry(message) {
+function toArchiveEntry(message, previous) {
   if (!message || !message.id) return null;
 
   const author = message.author || {};
-  const channelId = asString(message.channel_id || message.channelId);
+  const channelId = asString(message.channel_id || message.channelId || previous?.channelId);
   const channel = fluxStores.ChannelStore?.getChannel?.(channelId);
   // Delete and store-recovery payloads do not always include guild_id. A
   // guild channel carries the same information, while DM channels do not.
   const guildId = asString(
-    message.guild_id || message.guildId || message.guild?.id || channel?.guild_id || channel?.guildId,
+    message.guild_id || message.guildId || message.guild?.id || channel?.guild_id || channel?.guildId || previous?.guildId,
   );
   const guild = fluxStores.GuildStore?.getGuild?.(guildId);
   const attachments = Array.isArray(message.attachments)
     ? message.attachments.map(normaliseAttachment)
-    : [];
-  const embeds = Array.isArray(message.embeds) ? message.embeds.map(normaliseEmbed) : [];
-  const content = asString(message.content);
+    : message.attachments === undefined ? previous?.attachments || [] : [];
+  const embeds = Array.isArray(message.embeds)
+    ? message.embeds.map(normaliseEmbed)
+    : message.embeds === undefined ? previous?.embeds || [] : [];
+  const content = message.content === undefined ? asString(previous?.content) : asString(message.content);
 
-  if (!content && attachments.length === 0 && embeds.length === 0 && !author.username) return null;
+  if (!previous && !content && attachments.length === 0 && embeds.length === 0 && !author.username) return null;
 
   return {
     id: asString(message.id),
     channelId,
     guildId,
     guildName: asString(
-      message.guild?.name || message.guild_name || message.guildName || guild?.name || channel?.guild?.name,
+      message.guild?.name || message.guild_name || message.guildName || guild?.name || channel?.guild?.name || previous?.guildName,
     ),
-    directMessageName: guildId ? "" : directMessageName(channel),
-    channelName: channelName(channel),
-    authorId: asString(author.id || message.author_id || message.authorId),
-    author: asString(author.global_name || author.display_name || author.username, "Unknown user"),
-    username: asString(author.username),
+    directMessageName: guildId ? "" : directMessageName(channel) || previous?.directMessageName || "",
+    channelName: channelName(channel) || previous?.channelName || "",
+    authorId: asString(author.id || message.author_id || message.authorId || previous?.authorId),
+    authorBot: Boolean(author.bot ?? message.authorBot ?? previous?.authorBot ?? fluxStores.UserStore?.getUser?.(asString(author.id || message.author_id || message.authorId))?.bot),
+    author: asString(author.global_name || author.display_name || author.username || previous?.author, "Unknown user"),
+    username: asString(author.username, previous?.username || ""),
     content,
     attachments,
     embeds,
-    timestamp: asString(message.timestamp, new Date().toISOString()),
+    timestamp: asString(message.timestamp, previous?.timestamp || new Date().toISOString()),
   };
 }
 
@@ -845,57 +1374,80 @@ async function cachePhoto(messageId, attachment) {
   if (!attachment.isImage || sourceUrls.length === 0) return;
 
   const key = attachmentKey(attachment);
+  const target = photoCaptureAttachment(messageId, key);
+  if (!target?.isImage || target.blobKey || pluginUnloading) return;
   const captureKey = `${messageId}:${key}`;
   if (photoCapturesInFlight.has(captureKey)) return;
   photoCapturesInFlight.add(captureKey);
+  const controller = new AbortController();
+  photoCaptureControllers.set(captureKey, { controller, messageId, key });
+  const timeout = setTimeout(() => controller.abort(), PHOTO_CAPTURE_TIMEOUT_MS);
+  let rejectOnAbort;
+  const cancelled = new Promise((_, reject) => {
+    rejectOnAbort = () => reject(new Error("Photo capture cancelled."));
+    controller.signal.addEventListener("abort", rejectOnAbort, { once: true });
+  });
+  // Cancellation may arrive while IndexedDB is finishing a write, when there
+  // is no fetch/body race currently awaiting this promise.
+  void cancelled.catch(() => {});
 
   try {
     let blob;
 
     for (let sourceIndex = 0; sourceIndex < sourceUrls.length; sourceIndex += 1) {
-      const latestEntry = pendingMessages.get(messageId) || entries().find((entry) => entry.id === messageId);
-      const latestAttachment = latestEntry?.attachments?.find(
-        (item) => attachmentKey(item) === attachmentKey(attachment),
-      );
+      const latestAttachment = photoCaptureAttachment(messageId, key);
+      if (!latestAttachment?.isImage || latestAttachment.blobKey || pluginUnloading) return;
       photoSourceUrls(latestAttachment).forEach((url) => {
         if (!sourceUrls.includes(url)) sourceUrls.push(url);
       });
       const sourceUrl = sourceUrls[sourceIndex];
-      const response = await fetch(sourceUrl);
-      if (!response.ok) continue;
+      try {
+        const response = await Promise.race([
+          fetch(sourceUrl, { signal: controller.signal }),
+          cancelled,
+        ]);
+        if (!response.ok) continue;
 
-      const candidate = await readBoundedResponseBlob(response);
-      if (!candidate) continue;
+        const candidate = await Promise.race([readBoundedResponseBlob(response), cancelled]);
+        if (!candidate) continue;
 
-      // Discord may serve an image as application/octet-stream. The attachment
-      // metadata is still authoritative, so retain it with that image type.
-      const imageType = candidate.type.startsWith("image/")
-        ? candidate.type
-        : attachment.contentType.startsWith("image/")
-          ? attachment.contentType
-          : imageTypeFromFilename(attachment.filename);
-      if (!imageType) continue;
+        // Discord may serve an image as application/octet-stream. The attachment
+        // metadata is still authoritative, so retain it with that image type.
+        const imageType = candidate.type.startsWith("image/")
+          ? candidate.type
+          : latestAttachment.contentType.startsWith("image/")
+            ? latestAttachment.contentType
+            : imageTypeFromFilename(latestAttachment.filename);
+        if (!imageType) continue;
 
-      blob = new Blob([candidate], { type: imageType });
-      break;
+        blob = new Blob([candidate], { type: imageType });
+        break;
+      } catch {
+        if (controller.signal.aborted) break;
+        // A failed proxy or response stream must not skip the remaining URLs.
+      }
     }
 
     if (!blob) {
       setPhotoCaptureStatus(messageId, key, true);
       return;
     }
+    clearTimeout(timeout);
 
-    if (pluginUnloading) return;
+    const latestAttachment = photoCaptureAttachment(messageId, key);
+    if (pluginUnloading || controller.signal.aborted || !latestAttachment?.isImage || latestAttachment.blobKey) return;
     let current = entries();
     let entryIndex = current.findIndex((entry) => entry.id === messageId);
     if (entryIndex === -1 && !pendingMessages.has(messageId)) return;
 
-    const blobKey = captureKey;
+    // A stale download may finish after its attachment is removed or repaired.
+    // Its cleanup must never delete a newer capture using the same message ID.
+    const blobKey = `${captureKey}:${crypto.randomUUID()}`;
     await writePhotoBlob(blobKey, blob);
     current = entries();
     entryIndex = current.findIndex((entry) => entry.id === messageId);
     const pending = pendingMessages.get(messageId);
-    if (pluginUnloading || (entryIndex === -1 && !pending)) {
+    if (pluginUnloading || controller.signal.aborted || (entryIndex === -1 && !pending)) {
       await deletePhotoBlobs([blobKey]);
       return;
     }
@@ -947,17 +1499,33 @@ async function cachePhoto(messageId, attachment) {
     // instead of presenting the expiring remote link as archived content.
     setPhotoCaptureStatus(messageId, key, true);
   } finally {
+    clearTimeout(timeout);
+    controller.signal.removeEventListener("abort", rejectOnAbort);
+    photoCaptureControllers.delete(captureKey);
     photoCapturesInFlight.delete(captureKey);
   }
 }
 
 function cachePhotos(messageId, attachments) {
+  if (pluginUnloading || archiveClearing) return;
+  drainPhotoCaptureQueue();
   attachments.forEach((attachment) => {
     if (!attachment.isImage || attachment.blobKey) return;
 
-    const captureKey = `${messageId}:${attachmentKey(attachment)}`;
+    const key = attachmentKey(attachment);
+    const target = photoCaptureAttachment(messageId, key);
+    if (!target?.isImage || target.blobKey) return;
+    const captureKey = `${messageId}:${key}`;
     if (photoCapturesInFlight.has(captureKey) || queuedPhotoCaptures.has(captureKey)) return;
 
+    if (photoCaptureQueue.length >= MAX_PHOTO_CAPTURE_QUEUE) {
+      // Prefer persistent archive repairs over temporary pre-delete staging.
+      // A full archive-only queue can be retried by a later backfill/repair.
+      const temporary = photoCaptureQueue.findIndex((job) => !entries().some((entry) => entry.id === job.messageId));
+      if (temporary === -1) return;
+      const [discarded] = photoCaptureQueue.splice(temporary, 1);
+      queuedPhotoCaptures.delete(discarded.captureKey);
+    }
     queuedPhotoCaptures.add(captureKey);
     photoCaptureQueue.push({ messageId, attachment, captureKey });
   });
@@ -966,10 +1534,25 @@ function cachePhotos(messageId, attachments) {
 }
 
 function drainPhotoCaptureQueue() {
+  // Pending entries can be evicted while all download slots are stalled. Drop
+  // their work immediately, but keep attachments now owned by an archive entry.
+  for (let index = photoCaptureQueue.length - 1; index >= 0; index--) {
+    const job = photoCaptureQueue[index];
+    const target = photoCaptureAttachment(job.messageId, attachmentKey(job.attachment));
+    if (target?.isImage && !target.blobKey) continue;
+    photoCaptureQueue.splice(index, 1);
+    queuedPhotoCaptures.delete(job.captureKey);
+  }
+  for (const { controller, messageId, key } of photoCaptureControllers.values()) {
+    const target = photoCaptureAttachment(messageId, key);
+    if (!target?.isImage || target.blobKey) controller.abort();
+  }
+  if (pluginUnloading) return;
   while (activePhotoCaptures < 3 && photoCaptureQueue.length) {
     const { messageId, attachment, captureKey } = photoCaptureQueue.shift();
     queuedPhotoCaptures.delete(captureKey);
-    if (!pendingMessages.has(messageId) && !entries().some((entry) => entry.id === messageId)) continue;
+    const target = photoCaptureAttachment(messageId, attachmentKey(attachment));
+    if (!target?.isImage || target.blobKey) continue;
     activePhotoCaptures += 1;
 
     void cachePhoto(messageId, attachment).finally(() => {
@@ -984,38 +1567,117 @@ function backfillArchivedPhotos() {
 }
 
 function mergeArchiveEntry(previous, incoming) {
+  const attachments = incoming.attachments === undefined
+    ? previous.attachments
+    : mergeAttachments(incoming.attachments, previous.attachments);
+  const currentKeys = new Set((attachments || []).map(attachmentKey));
   return {
     ...previous,
     ...incoming,
-    // MESSAGE_UPDATE payloads are often partial. Preserve richer data already captured.
-    content: incoming.content || previous.content,
-    attachments: incoming.attachments.length
-      ? mergeAttachments(incoming.attachments, previous.attachments)
-      : previous.attachments,
-    embeds: incoming.embeds.length ? incoming.embeds : previous.embeds,
+    // Normalization preserves omitted fields; explicit empty values are edits.
+    content: incoming.content ?? previous.content,
+    // A normal re-render must not discard attachment history or resurrect a
+    // removed attachment that only exists in our local archive.
+    attachments: [...(attachments || []), ...(previous.attachments || [])
+      .filter((attachment) => attachment.removedAt && !currentKeys.has(attachmentKey(attachment)))],
+    embeds: incoming.embeds ?? previous.embeds,
     guildName: incoming.guildName || previous.guildName || "",
     directMessageName: incoming.directMessageName || previous.directMessageName || "",
     channelName: incoming.channelName || previous.channelName || "",
   };
 }
 
-function rememberMessage(message) {
-  if (!shouldCaptureMessage(message)) return false;
+function preserveMessageEdits(previous, incoming, message) {
+  const now = new Date().toISOString();
+  const editTime = asString(message.edited_timestamp || message.editedTimestamp, now);
+  let editHistory = previous.editHistory || [];
+  const contentChanged = message.content !== undefined && incoming.content !== previous.content;
+  if (store.logEdits !== false && contentChanged) {
+    editHistory = [...editHistory, { content: previous.content, editedAt: editTime }].slice(-MAX_EDIT_REVISIONS);
+    let bytes = 0;
+    editHistory = editHistory.slice().reverse().filter((revision) => {
+      bytes += (asString(revision.content).length + asString(revision.editedAt).length) * 2 + 32;
+      return bytes <= MAX_EDIT_HISTORY_BYTES;
+    }).reverse();
+  }
 
-  const incoming = toArchiveEntry(message);
+  let attachments = incoming.attachments;
+  let removed = false;
+  if (store.logDeletedAttachments !== false && Array.isArray(message.attachments)) {
+    const currentKeys = new Set(message.attachments.map((attachment) => attachmentKey(normaliseAttachment(attachment))));
+    const absent = (previous.attachments || []).filter((attachment) => !currentKeys.has(attachmentKey(attachment)));
+    removed = absent.some((attachment) => !attachment.removedAt);
+    const historical = [...absent.filter((attachment) => attachment.removedAt),
+      ...absent.filter((attachment) => !attachment.removedAt)]
+      .map((attachment) => ({ ...attachment, removedAt: attachment.removedAt || editTime }))
+      .slice(-MAX_REMOVED_ATTACHMENTS);
+    attachments = [...attachments.filter((attachment) => !attachment.removedAt), ...historical];
+  }
+  const changed = (store.logEdits !== false && contentChanged) || removed;
+  return { ...incoming, attachments, editHistory,
+    editedAt: changed ? editTime : previous.editedAt,
+  };
+}
+
+function rememberMessage(message, isUpdate = false, revision = ++historyCaptureRevision) {
+  if (pluginUnloading || archiveClearing) return false;
+  const messageId = asString(message?.id);
+  // Deferred edits keep their arrival revision when replayed after hydration.
+  // A newer capture wins, while successive queued patches still merge in order.
+  if (Math.max(historyMessages.get(messageId)?.revision || 0,
+    archiveCaptureRevisions.get(messageId) || 0) > revision) return false;
+  const previousPending = pendingMessages.get(messageId);
+  const archived = entries().find((entry) => entry.id === messageId);
+  const previous = archived || previousPending || historyEntry(messageId) ||
+    (isUpdate ? toArchiveEntry(messageFromStore(messageId, messageLocation(message).channelId)) : null);
+  if (messageId && historyCaptureEnabled() && !historyLoaded && !previous &&
+    (isUpdate || !message?.author || !message?.timestamp)) {
+    // Partial edits arriving during startup need the persisted original's
+    // author, timestamp and omitted fields before they can be normalized.
+    const generation = historyGeneration;
+    void initializeHistoryCache().then(() => {
+      if (generation === historyGeneration && historyLoaded && !pluginUnloading && !archiveClearing) rememberMessage(message, isUpdate, revision);
+    }).catch((error) => console.error("[Alexandria] Could not update a cached history message", error));
+    return false;
+  }
+  if (!shouldCaptureMessage({ ...previous, ...message }, previous?.channelId)) return false;
+
+  // Retained Discord rows may now contain thumbnail blob URLs. The archived
+  // original is authoritative and must not re-enter the temporary photo cache.
+  if (archived?.deleted) return true;
+
+  const incoming = toArchiveEntry(message, previous);
   if (!incoming) return false;
 
-  const previous = pendingMessages.get(incoming.id);
-  const remembered = previous ? mergeArchiveEntry(previous, incoming) : incoming;
-  if (previous) {
-    pendingMessageBytes -= pendingEntryBytes(previous);
-    pendingPhotoBytes -= pendingEntryPhotoBytes(previous);
+  let remembered = previous ? mergeArchiveEntry(previous, incoming) : incoming;
+  if (previous && isUpdate) remembered = preserveMessageEdits(previous, remembered, message);
+  if (previousPending) {
+    pendingMessageBytes -= pendingEntryBytes(previousPending);
+    pendingPhotoBytes -= pendingEntryPhotoBytes(previousPending);
   }
   // Map insertion order makes eviction inexpensive and bounds live memory.
   pendingMessages.delete(incoming.id);
+  removeReplacedPhotoBlobs(previous, remembered);
+  const hasHistory = remembered.editHistory?.length || remembered.attachments.some((attachment) => attachment.removedAt);
+  if (archived || hasHistory) {
+    const candidate = archived
+      ? entries().map((entry) => entry.id === messageId ? remembered : entry)
+      : [...entries(), remembered];
+    const next = trimArchive(candidate);
+    store[ARCHIVE_KEY] = next;
+    archiveCaptureRevisions.set(messageId, revision);
+    const retainedIds = new Set(next.map((entry) => entry.id));
+    for (const id of archiveCaptureRevisions.keys()) {
+      if (!retainedIds.has(id)) archiveCaptureRevisions.delete(id);
+    }
+    forgetHistoryEntry(messageId);
+    if (next.some((entry) => entry.id === messageId)) cachePhotos(messageId, remembered.attachments);
+    return true;
+  }
   pendingMessages.set(incoming.id, remembered);
   pendingMessageBytes += pendingEntryBytes(remembered);
   pendingPhotoBytes += pendingEntryPhotoBytes(remembered);
+  rememberHistoryEntry(remembered, revision);
   while (pendingMessages.size > MAX_PENDING_MESSAGES || pendingMessageBytes > MAX_PENDING_BYTES) {
     const [oldestId, oldest] = pendingMessages.entries().next().value;
     pendingMessages.delete(oldestId);
@@ -1065,6 +1727,12 @@ function messageFromRenderedDom(id, channelId) {
 }
 
 function messageWithRenderedAttachmentUrls(message, element) {
+  // React can still expose the previous props immediately after an edit.
+  // Use Discord's current store for content and attachment membership, then
+  // recover only the displayed media URLs from that row.
+  if (message?.id) {
+    message = messageFromStore(asString(message.id), messageLocation(message).channelId) || message;
+  }
   if (!message || !Array.isArray(message.attachments) || !message.attachments.length) return message;
   const row = element?.closest?.('[data-list-item-id], li') || element;
   const renderedUrls = [
@@ -1084,7 +1752,9 @@ function messageWithRenderedAttachmentUrls(message, element) {
       } catch {
         // Keep matching against the encoded URL if decoding fails.
       }
-      return (id && url.includes(`/${id}/`)) || (filename && decodedUrl.includes(`/${filename}`));
+      // An edited attachment can reuse a filename while the DOM still shows
+      // the old photo. A known attachment ID must match before using its URL.
+      return id ? url.includes(`/${id}/`) : Boolean(filename && decodedUrl.includes(`/${filename}`));
     });
     return renderedUrl
       ? { ...attachment, proxy_url: renderedUrl, proxyUrl: renderedUrl, proxyURL: renderedUrl }
@@ -1093,7 +1763,7 @@ function messageWithRenderedAttachmentUrls(message, element) {
   return { ...message, attachments };
 }
 
-function markDeleted(id, channelId) {
+function markDeleted(id, channelId, snapshot) {
   if (!id) return false;
 
   const messageId = asString(id);
@@ -1106,6 +1776,7 @@ function markDeleted(id, channelId) {
   // action is still in flight, then archive them like any other message.
   if (index === -1) {
     const message =
+      snapshot ||
       messageFromRenderedDom(messageId, asString(channelId)) ||
       messageFromStore(messageId, asString(channelId));
     if (message) {
@@ -1114,13 +1785,14 @@ function markDeleted(id, channelId) {
     }
   }
 
-  if (index === -1 && !pending) return false;
+  const captured = pending || historyEntry(messageId);
+  if (index === -1 && !captured) return false;
   if (index !== -1 && current[index].deleted) return true;
 
   const previous = index === -1 ? null : current[index];
   const archived = previous
-    ? { ...mergeArchiveEntry(previous, pending || previous), deleted: true, deletedAt: new Date().toISOString() }
-    : { ...pending, deleted: true, deletedAt: new Date().toISOString() };
+    ? { ...mergeArchiveEntry(previous, captured || previous), deleted: true, deletedAt: new Date().toISOString() }
+    : { ...captured, deleted: true, deletedAt: new Date().toISOString() };
   const candidate = index === -1 ? [...current, archived] : current.map((entry, entryIndex) => (entryIndex === index ? archived : entry));
   const next = trimArchive(candidate);
   store[ARCHIVE_KEY] = next;
@@ -1129,10 +1801,36 @@ function markDeleted(id, channelId) {
     pendingPhotoBytes = Math.max(0, pendingPhotoBytes - pendingEntryPhotoBytes(pending));
   }
   pendingMessages.delete(messageId);
+  forgetHistoryEntry(messageId);
   if (next.some((entry) => entry.id === messageId)) cachePhotos(messageId, archived.attachments);
   scheduleArchiveTrim();
 
-  markDeletedMessageAfterRender(messageId, asString(channelId));
+  return next.some((entry) => entry.id === messageId);
+}
+
+function captureDeletedMessage(messageId, channelId, snapshot) {
+  const remembered = pendingMessages.get(messageId) || historyEntry(messageId) || entries().find((entry) => entry.id === messageId);
+  if (shouldIgnoreMessage({ ...remembered, ...snapshot }, channelId)) return false;
+  if (!shouldCaptureMessage({ ...remembered, ...snapshot }, channelId) && !pendingMessages.has(messageId)) {
+    recoverHistoryDeletion(messageId, channelId);
+    return false;
+  }
+
+  try {
+    if (!markDeleted(messageId, channelId, snapshot)) {
+      recoverHistoryDeletion(messageId, channelId);
+      return false;
+    }
+  } catch {
+    // Failed archival must leave Discord's normal delete processing intact.
+    return false;
+  }
+
+  // An archive-only snapshot cannot establish that Discord has a row to retain.
+  if (!snapshot?.id || !isActiveMessageLocation(snapshot, channelId)) return false;
+  if (visibleDeletedMessages.has(messageId)) return true;
+  if (!retainDeletedMessagePreview(messageId, channelId, snapshot)) return false;
+  compactRetainedMessage(messageId, channelId, snapshot);
   return true;
 }
 
@@ -1150,12 +1848,18 @@ function messageFromPayload(payload) {
 
 function handleDispatch(payload) {
   if (!payload?.type) return;
+  if (pluginUnloading || archiveClearing) return;
   if (store.captureEnabled === false) return;
 
   if (payload.type === "CHANNEL_SELECT" || payload.type === "GUILD_SELECT") {
     // Let Discord update its selected-channel store and render the new view,
-    // then index already-loaded messages when Active mode is in use.
-    if (store.activeMode === true) setTimeout(captureLoadedMessages, 0);
+    // then index already-loaded messages and restore retained red rows. React
+    // can reuse message DOM nodes across channels, so the observer alone is not
+    // sufficient when opening a channel after its deletion was intercepted.
+    setTimeout(() => {
+      if (store.activeMode === true || historyCaptureEnabled()) captureLoadedMessages();
+      refreshSelectedChannelDeletedStyles();
+    }, 0);
     return;
   }
 
@@ -1168,60 +1872,46 @@ function handleDispatch(payload) {
   ) return;
 
   if (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") {
-    rememberMessage(messageFromPayload(payload));
+    rememberMessage(messageFromPayload(payload), payload.type === "MESSAGE_UPDATE");
+    return;
+  }
+
+  if (historyCaptureEnabled() && payload.type === "LOAD_MESSAGES_SUCCESS") {
+    captureHistoryLoadMessages(payload.messages, asString(payload.channelId || payload.channel_id));
     return;
   }
 
   if (payload.type === "MESSAGE_DELETE") {
-    const messageId = payload.id || payload.messageId || payload.message?.id;
-    const channelId =
-      payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId;
+    const messageId = asString(payload.id || payload.messageId || payload.message?.id);
+    const channelId = asString(
+      payload.channel_id || payload.channelId || payload.message?.channel_id || payload.message?.channelId,
+    );
     const snapshot =
       messageFromRenderedDom(asString(messageId), asString(channelId)) ||
       messageFromStore(asString(messageId), asString(channelId)) ||
       payload.message;
-    // A message remembered while it was visible remains eligible even if the
-    // delete payload no longer contains enough channel metadata to re-check
-    // the selected-scope setting.
-    if (!shouldCaptureMessage(snapshot, channelId) && !pendingMessages.has(asString(messageId))) return;
-
-    try {
-      markDeleted(messageId, channelId);
-    } catch {
-      // Archive enrichment is best-effort and must never affect Discord's
-      // normal delete processing.
-    }
-    // Keep the red in-chat treatment until the plugin unloads or the bounded
-    // session-retention queue evicts this row.
-    const compacted = compactRetainedMessage(asString(messageId), asString(channelId), snapshot);
-    retainDeletedMessagePreview(asString(messageId), asString(channelId), compacted);
-    return false;
+    if (captureDeletedMessage(messageId, channelId, snapshot)) return false;
+    return;
   }
 
   if (payload.type === "MESSAGE_DELETE_BULK") {
-    const ids = payload.ids || payload.messageIds || payload.messages;
+    const idsKey = ["ids", "messageIds", "messages"].find((key) => Array.isArray(payload[key]));
+    if (!idsKey) return;
+    const ids = payload[idsKey];
     const channelId = payload.channel_id || payload.channelId;
-    if (!shouldCaptureMessage(null, channelId)) return;
-    if (Array.isArray(ids)) {
-      ids.forEach((id) => {
-        const messageId = asString(id?.id || id);
-        const messageChannelId = asString(id?.channel_id || id?.channelId || channelId);
-        const snapshot =
-          messageFromRenderedDom(messageId, messageChannelId) ||
-          messageFromStore(messageId, messageChannelId) ||
-          id?.message;
-        try {
-          markDeleted(messageId, messageChannelId);
-        } catch {
-          // Keep each retained row independent from archive enrichment.
-        }
-        const compacted = compactRetainedMessage(messageId, messageChannelId, snapshot);
-        retainDeletedMessagePreview(messageId, messageChannelId, compacted);
-      });
-    }
-    // Deleted rows last for the session, but count and estimated encoded plus
-    // decoded image memory caps keep bulk deletes from growing without bound.
-    return false;
+    const remainingIds = ids.filter((id) => {
+      const messageId = asString(id?.id || id);
+      const messageChannelId = asString(id?.channel_id || id?.channelId || channelId);
+      const snapshot =
+        messageFromRenderedDom(messageId, messageChannelId) ||
+        messageFromStore(messageId, messageChannelId) ||
+        id?.message;
+      return !captureDeletedMessage(messageId, messageChannelId, snapshot);
+    });
+    if (remainingIds.length === ids.length) return;
+    if (!remainingIds.length) return false;
+    // Preserve normal deletion of unknown/out-of-scope IDs in mixed batches.
+    return { ...payload, [idsKey]: remainingIds };
   }
 }
 
@@ -1292,20 +1982,20 @@ function applyLivePhotoPreviews(messageId, channelId) {
       }) || images[index];
       if (!image) return;
 
-      image.removeAttribute("srcset");
+      if (image.hasAttribute("srcset")) image.removeAttribute("srcset");
       image.closest("picture")?.querySelectorAll("source").forEach((source) => {
-        source.removeAttribute("srcset");
-        source.srcset = preview.url;
+        if (source.getAttribute("srcset") !== preview.url) source.srcset = preview.url;
       });
-      image.src = preview.url;
+      if (image.getAttribute("src") !== preview.url) image.src = preview.url;
       const link = image.closest("a");
       const clickTarget = image.closest('a, [role="button"]') || image.parentElement;
       [image, link, clickTarget].filter(Boolean).forEach((element) => {
-        element.dataset.alexandriaLivePhoto = "true";
-        element.dataset.alexandriaMessageId = messageId;
-        element.dataset.alexandriaAttachmentKey = preview.id || preview.filename;
+        if (element.dataset.alexandriaLivePhoto !== "true") element.dataset.alexandriaLivePhoto = "true";
+        if (element.dataset.alexandriaMessageId !== messageId) element.dataset.alexandriaMessageId = messageId;
+        const key = preview.id || preview.filename;
+        if (element.dataset.alexandriaAttachmentKey !== key) element.dataset.alexandriaAttachmentKey = key;
       });
-      if (link) link.href = preview.url;
+      if (link && link.getAttribute("href") !== preview.url) link.href = preview.url;
     });
   });
 }
@@ -1381,9 +2071,9 @@ function markRenderedMessageDeleted(messageId, channelId) {
   // Discord's rendered rows use this ID. Unlike a fiber lookup, it remains
   // reliable after the delete dispatch has been intercepted.
   renderedMessageRows(messageId, channelId).forEach((row) => {
-    row.classList.add("alexandria-deleted-message");
-    row.dataset.alexandriaDeleted = "true";
-    row.dataset.alexandriaMessageId = messageId;
+    if (!row.classList.contains("alexandria-deleted-message")) row.classList.add("alexandria-deleted-message");
+    if (row.dataset.alexandriaDeleted !== "true") row.dataset.alexandriaDeleted = "true";
+    if (row.dataset.alexandriaMessageId !== messageId) row.dataset.alexandriaMessageId = messageId;
     // Older Alexandria versions injected a badge into the message DOM. The
     // MessageLogger-style treatment uses the row itself and needs no marker.
     row.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
@@ -1395,37 +2085,70 @@ function clearRenderedDeletedStyles() {
   document.querySelectorAll(".alexandria-deleted-message").forEach((row) => {
     row.classList.remove("alexandria-deleted-message");
     delete row.dataset.alexandriaDeleted;
+    delete row.dataset.alexandriaMessageId;
+  });
+  document.querySelectorAll('[data-alexandria-live-photo="true"]').forEach((element) => {
+    delete element.dataset.alexandriaLivePhoto;
+    delete element.dataset.alexandriaMessageId;
+    delete element.dataset.alexandriaAttachmentKey;
   });
   document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
 }
 
 function markDeletedMessageAfterRender(messageId, channelId) {
+  if (pluginUnloading || !visibleDeletedMessages.has(messageId)) return;
+
   // The retained row can be re-rendering while Discord processes the blocked
-  // delete event. Try again on the next two render turns without keeping a
-  // permanent observer alive.
+  // delete event. Retry briefly while the DOM observer handles later renders.
   markRenderedMessageDeleted(messageId, channelId);
   [0, 100, 500, 1_500].forEach((delay) =>
-    setTimeout(() => markRenderedMessageDeleted(messageId, channelId), delay),
+    setTimeout(() => {
+      if (!pluginUnloading && visibleDeletedMessages.has(messageId)) {
+        markRenderedMessageDeleted(messageId, channelId);
+      }
+    }, delay),
   );
 }
 
+function refreshSelectedChannelDeletedStyles() {
+  const activeChannelId = selectedChannelId();
+  if (!activeChannelId) return;
+
+  for (const [messageId, preview] of visibleDeletedMessages) {
+    if (preview.channelId === activeChannelId) {
+      markDeletedMessageAfterRender(messageId, preview.channelId);
+    }
+  }
+}
+
 function captureRenderedMessage(element) {
-  if (!element || element.dataset.alexandriaCaptured) return;
+  if (!element) return;
+  if (pluginUnloading || archiveClearing) return;
   if (store.captureEnabled === false) return;
 
   const message = messageWithRenderedAttachmentUrls(messageFromRenderedElement(element), element);
   // Do not mark the element until its fiber has yielded a message. React can
   // briefly render the element before the message props are attached.
   if (!message) return;
+  const messageId = asString(message.id);
+  const retained = visibleDeletedMessages.get(messageId);
+  if (retained) {
+    // Observation also sees our own DOM mutations. Reapply styling without
+    // scheduling more retries or recapturing the compacted thumbnail URLs.
+    markRenderedMessageDeleted(messageId, retained.channelId);
+    return;
+  }
+  if (
+    element.dataset.alexandriaCaptured === messageId &&
+    (pendingMessages.has(messageId) || entries().some((entry) => entry.id === messageId))
+  ) return;
   if (!rememberMessage(message)) return;
-  element.dataset.alexandriaCaptured = "1";
-
-  const archived = entries().find((entry) => entry.id === asString(message.id));
-  if (archived?.deleted) markDeletedMessageAfterRender(archived.id, archived.channelId);
+  if (element.dataset.alexandriaCaptured !== messageId) element.dataset.alexandriaCaptured = messageId;
 }
 
 function captureLoadedMessages() {
   if (store.captureEnabled === false) return;
+  captureLoadedHistory();
 
   // Existing messages do not dispatch MESSAGE_CREATE while Alexandria is
   // starting. Scan the rendered DOM directly so messages sent earlier in the
@@ -1442,13 +2165,19 @@ function channelIdFromUrl(url) {
 
 async function captureSentMessage(request, send) {
   const response = await send(request);
-  const responseMessage = messageFromPayload(response?.body);
-
-  if (responseMessage) {
-    rememberMessage({
-      ...responseMessage,
-      channel_id: responseMessage.channel_id || channelIdFromUrl(request?.url),
-    });
+  if (pluginUnloading || archiveClearing) return response;
+  try {
+    const responseMessage = messageFromPayload(response?.body);
+    if (responseMessage) {
+      rememberMessage({
+        ...responseMessage,
+        channel_id: responseMessage.channel_id || channelIdFromUrl(request?.url),
+      });
+    }
+  } catch (error) {
+    // Capture is best effort: a local failure must not make Discord treat an
+    // already successful send as failed and potentially resend the message.
+    console.error("[Alexandria] Could not capture sent message", error);
   }
 
   return response;
@@ -1516,6 +2245,7 @@ function removeArchiveEntry(messageId) {
   const next = current.filter((entry) => entry.id !== messageId);
   if (next.length !== current.length) {
     store[ARCHIVE_KEY] = next;
+    archiveCaptureRevisions.delete(messageId);
     void deletePhotoBlobs(entryPhotoKeys(entry)).catch((error) => {
       console.error("[Alexandria] Could not remove archived photo blobs", error);
     });
@@ -1580,7 +2310,29 @@ function handleMessageContextMenu(event) {
 }
 
 function SearchablePicker(props) {
-  const selectedLabel = () => props.options().find((option) => option.value === props.value)?.label || "";
+  const options = createMemo(() => {
+    const normalize = (label) => label.trim().normalize("NFC").toLocaleLowerCase();
+    const incoming = props.options();
+    const counts = new Map();
+    incoming.forEach((option) => {
+      const label = normalize(option.label);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    });
+    const usedLabels = new Set();
+    return incoming.map((option) => {
+      let label = option.label;
+      if (counts.get(normalize(label)) > 1) {
+        // A datalist returns its displayed text, so identical names otherwise
+        // always resolve to the first server/person/conversation with that name.
+        do {
+          label = `${label} (${option.value})`;
+        } while (counts.has(normalize(label)) || usedLabels.has(normalize(label)));
+      }
+      usedLabels.add(normalize(label));
+      return { ...option, label };
+    });
+  });
+  const selectedLabel = () => options().find((option) => option.value === props.value)?.label || "";
   const [inputValue, setInputValue] = createSignal(selectedLabel());
 
   createEffect(() => {
@@ -1590,8 +2342,8 @@ function SearchablePicker(props) {
 
   function updateInput(value) {
     setInputValue(value);
-    const match = props.options().find(
-      (option) => option.label.localeCompare(value.trim(), undefined, { sensitivity: "accent" }) === 0,
+    const match = options().find(
+      (option) => option.label.trim().localeCompare(value.trim(), undefined, { sensitivity: "accent" }) === 0,
     );
 
     if (match) props.onChange(match.value);
@@ -1614,7 +2366,7 @@ function SearchablePicker(props) {
         onInput={(event) => updateInput(event.currentTarget.value)}
       />
       <datalist id={`${props.id}-options`}>
-        <For each={props.options()}>{(option) => <option value={option.label} />}</For>
+        <For each={options()}>{(option) => <option value={option.label} />}</For>
       </datalist>
       <Show when={props.value}>
         <button class="alexandria-picker-clear" type="button" onClick={clear} aria-label={`Clear ${props.placeholder}`}>
@@ -1764,6 +2516,7 @@ function CaptureScopeSettings() {
     const nextMode = asString(value, "all");
     setMode(nextMode);
     store.captureMode = nextMode;
+    refreshHistoryCapture();
     if (store.captureEnabled !== false) setTimeout(captureLoadedMessages, 0);
   };
 
@@ -1774,6 +2527,7 @@ function CaptureScopeSettings() {
       : current.filter((id) => id !== value);
     store[key] = next;
     setter(next);
+    refreshHistoryCapture();
     if (checked && mode() === "selected" && store.captureEnabled !== false) {
       setTimeout(captureLoadedMessages, 0);
     }
@@ -1787,6 +2541,7 @@ function CaptureScopeSettings() {
           const enabled = Boolean(value);
           setActiveMode(enabled);
           store.activeMode = enabled;
+          refreshHistoryCapture();
           if (enabled && store.captureEnabled !== false) setTimeout(captureLoadedMessages, 0);
         }}
         note={`Also record the server or DM currently open (${activeScopeLabel()}), even when it is not selected below. Existing selections keep recording, and the global Capture messages switch remains authoritative.`}
@@ -1986,9 +2741,14 @@ function ArchivedPhoto(props) {
 
 function PhotoModal(props) {
   const [copyState, setCopyState] = createSignal("idle");
+  const attachment = createMemo(() =>
+    entries().find((entry) => entry.id === props.messageId)?.attachments?.find(
+      (item) => attachmentKey(item) === attachmentKey(props.attachment),
+    ) || props.attachment,
+  );
   const photo = createArchivedPhotoResource(
-    () => props.attachment.blobKey,
-    () => repairMissingArchivedPhoto(props.messageId, props.attachment),
+    () => attachment().blobKey,
+    () => repairMissingArchivedPhoto(props.messageId, attachment()),
   );
 
   const handleCopy = async () => {
@@ -2008,7 +2768,7 @@ function PhotoModal(props) {
     <ModalRoot size={ModalSizes.LARGE} class="alexandria-modal alexandria-photo-modal">
       <ModalHeader close={props.close}>
         <div class="alexandria-photo-modal-title">
-          <strong>{props.attachment.filename || "Archived photo"}</strong>
+          <strong>{attachment().filename || "Archived photo"}</strong>
           <small>Saved locally by Alexandria</small>
         </div>
       </ModalHeader>
@@ -2017,12 +2777,12 @@ function PhotoModal(props) {
           when={photo.source()}
           fallback={
             <div class="alexandria-photo-preview alexandria-photo-status">
-              {photo.error() ? "Archived photo is unavailable." : "Loading archived photo…"}
+              {photo.error() || attachment().photoUnavailable ? "Archived photo is unavailable." : "Loading archived photo…"}
             </div>
           }
         >
           <div class="alexandria-photo-preview">
-            <img src={photo.source()} alt={props.attachment.filename || "Archived photo"} />
+            <img src={photo.source()} alt={attachment().filename || "Archived photo"} />
           </div>
         </Show>
         <div class="alexandria-copy-status" role="status" aria-live="polite">
@@ -2060,6 +2820,7 @@ function openPhoto(attachment, messageId) {
 function ArchiveModal(props) {
   const [query, setQuery] = createSignal("");
   const [showAll, setShowAll] = createSignal(false);
+  const [showEdited, setShowEdited] = createSignal(false);
   const [sortMode, setSortMode] = createSignal(store.sortMode || "deletedAt");
   const [selectedServer, setSelectedServer] = createSignal(store.serverFilter || "");
   const [selectedUser, setSelectedUser] = createSignal(store.userFilter || "");
@@ -2108,13 +2869,17 @@ function ArchiveModal(props) {
     const search = query().trim().toLowerCase();
 
     return entries()
-      .filter((entry) => showAll() || entry.deleted)
+      .filter((entry) => showAll() || (showEdited()
+        ? entry.editHistory?.length || entry.attachments?.some((attachment) => attachment.removedAt)
+        : entry.deleted))
       .filter((entry) => !selectedServer() || serverKey(entry) === selectedServer())
       .filter((entry) => !selectedUser() || userKey(entry) === selectedUser())
       .filter((entry) => !selectedDirectMessage() || entry.channelId === selectedDirectMessage())
       .filter((entry) => {
         if (!search) return true;
-        return `${entry.author} ${entry.username} ${entry.content} ${entry.channelId} ${directMessageLabel(entry)}`
+        const history = (entry.editHistory || []).map((revision) => revision.content).join(" ");
+        const attachments = (entry.attachments || []).map((attachment) => attachment.filename).join(" ");
+        return `${entry.id} ${entry.authorId} ${entry.author} ${entry.username} ${entry.content} ${history} ${attachments} ${entry.channelId} ${channelLabel(entry)}`
           .toLowerCase()
           .includes(search);
       })
@@ -2145,6 +2910,7 @@ function ArchiveModal(props) {
   createEffect(() => {
     query();
     showAll();
+    showEdited();
     sortMode();
     selectedServer();
     selectedUser();
@@ -2260,10 +3026,13 @@ function ArchiveModal(props) {
 
         <div class="alexandria-summary">
           <div class="alexandria-view-toggle" role="group" aria-label="Choose which messages to show">
-            <button classList={{ active: !showAll() }} type="button" onClick={() => setShowAll(false)}>
+            <button classList={{ active: !showAll() && !showEdited() }} type="button" onClick={() => { setShowAll(false); setShowEdited(false); }}>
               Deleted
             </button>
-            <button classList={{ active: showAll() }} type="button" onClick={() => setShowAll(true)}>
+            <button classList={{ active: !showAll() && showEdited() }} type="button" onClick={() => { setShowAll(false); setShowEdited(true); }}>
+              Edited
+            </button>
+            <button classList={{ active: showAll() }} type="button" onClick={() => { setShowAll(true); setShowEdited(false); }}>
               All archived
             </button>
           </div>
@@ -2288,7 +3057,8 @@ function ArchiveModal(props) {
                   ? "Try a broader search or clear the active filters."
                   : showAll()
                     ? "Captured messages will appear here as Alexandria sees them."
-                    : "Deleted messages will appear here after Alexandria captures them."}
+                    : showEdited() ? "Edits and removed attachments will appear here after Alexandria observes them."
+                      : "Deleted messages will appear here after Alexandria captures them."}
               </p>
               <Show when={activeFilterCount() > 0}>
                 <button type="button" onClick={resetFilters}>Clear all filters</button>
@@ -2310,7 +3080,7 @@ function ArchiveModal(props) {
                         </Show>
                       </div>
                     </div>
-                    <span class="alexandria-status">{entry.deleted ? "Deleted" : "Saved"}</span>
+                    <span class="alexandria-status">{entry.deleted ? "Deleted" : entry.editedAt ? "Edited" : "Saved"}</span>
                   </div>
                   <div class="alexandria-meta">
                     <span class="alexandria-location">{channelLabel(entry)}</span>
@@ -2318,9 +3088,25 @@ function ArchiveModal(props) {
                     <Show when={entry.deletedAt}>
                       <time datetime={entry.deletedAt}>Removed {formatDate(entry.deletedAt)}</time>
                     </Show>
+                    <Show when={entry.editedAt}>
+                      <time datetime={entry.editedAt}>Edited {formatDate(entry.editedAt)}</time>
+                    </Show>
                   </div>
                   <Show when={entry.content}>
                     <p class="alexandria-content">{entry.content}</p>
+                  </Show>
+                  <Show when={entry.editHistory?.length}>
+                    <details class="alexandria-edit-history">
+                      <summary>{entry.editHistory.length} previous version{entry.editHistory.length === 1 ? "" : "s"}</summary>
+                      <For each={entry.editHistory}>
+                        {(revision) => (
+                          <div class="alexandria-revision">
+                            <time datetime={revision.editedAt}>Replaced {formatDate(revision.editedAt)}</time>
+                            <p class="alexandria-content">{revision.content || "(Empty message)"}</p>
+                          </div>
+                        )}
+                      </For>
+                    </details>
                   </Show>
                   <Show when={entry.embeds?.length}>
                     <div class="alexandria-extra">
@@ -2340,6 +3126,10 @@ function ArchiveModal(props) {
                     <div class="alexandria-extra">
                       <For each={entry.attachments}>
                         {(attachment) => (
+                          <div classList={{ "alexandria-removed-attachment": Boolean(attachment.removedAt) }}>
+                          <Show when={attachment.removedAt}>
+                            <small>Attachment removed {formatDate(attachment.removedAt)}</small>
+                          </Show>
                           <Show
                             when={attachment.isImage}
                             fallback={<div class="alexandria-extra-item">↗ {attachment.filename}</div>}
@@ -2357,6 +3147,7 @@ function ArchiveModal(props) {
                               <ArchivedPhoto attachment={attachment} messageId={entry.id} />
                             </Show>
                           </Show>
+                          </div>
                         )}
                       </For>
                     </div>
@@ -2411,11 +3202,47 @@ async function clearArchive() {
       confirmText: "Clear archive",
       cancelText: "Keep archive",
     });
-    const archivedPhotoKeys = entries().flatMap(entryPhotoKeys);
-    store[ARCHIVE_KEY] = [];
-    await deletePhotoBlobs(archivedPhotoKeys);
   } catch {
     // Closing or cancelling the confirmation leaves the archive untouched.
+    return;
+  }
+  if (pluginUnloading || archiveClearing) return;
+
+  archiveClearing = true;
+  stopHistoryPreload();
+  historyPreloadNotBefore = Math.max(historyPreloadNotBefore, Date.now() + HISTORY_PRELOAD_REFRESH_MS);
+  try {
+    const archived = entries();
+    const archivedPhotoKeys = archived.flatMap(entryPhotoKeys);
+    store[ARCHIVE_KEY] = [];
+    archiveCaptureRevisions.clear();
+    // Preserve ordinary pre-delete captures, but remove any stale pending copy
+    // of an entry being cleared (including copies from older plugin versions).
+    archived.forEach((entry) => {
+      const pending = pendingMessages.get(entry.id);
+      if (!pending) return;
+      pendingMessages.delete(entry.id);
+      discardPendingEntry(pending);
+    });
+    removePhotoModal?.();
+    removePhotoModal = undefined;
+    clearRenderedDeletedStyles();
+    const cleanup = [...visibleDeletedMessages].map(([messageId, preview]) =>
+      Promise.resolve().then(() => releaseDeletedMessage(messageId, preview.channelId)),
+    );
+    cleanup.push(deletePhotoBlobs(archivedPhotoKeys), clearHistoryCache());
+    const results = await Promise.allSettled(cleanup);
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.error("[Alexandria] Could not finish archive cleanup", result.reason);
+      }
+    }
+  } catch (error) {
+    console.error("[Alexandria] Could not clear the archive", error);
+  } finally {
+    archiveClearing = false;
+    // Don't immediately refill history just after the user explicitly cleared it.
+    scheduleHistoryPreload(HISTORY_PRELOAD_REFRESH_MS);
   }
 }
 
@@ -2539,6 +3366,9 @@ export function onLoad() {
   void prepareMediaDatabase().catch((error) => {
     console.error("[Alexandria] Could not prepare the photo database", error);
   });
+  if (store.experimentalHistoryEnabled) refreshHistoryCapture();
+  else void clearHistoryCache();
+  scoped.onDispose(stopHistoryPreload);
   // Remove badges left in the DOM by Alexandria versions that predate the
   // MessageLogger-style deleted-message treatment.
   document.querySelectorAll(".alexandria-deleted-marker").forEach((marker) => marker.remove());
@@ -2553,7 +3383,8 @@ export function onLoad() {
     '[id^="message-username-"], [id^="message-content-"], img[src*="/attachments/"]',
     captureRenderedMessage,
   );
-  unobserve.now();
+  // The returned .now() cancels observation; it is not an initial DOM scan.
+  // Keep observation active and scan existing messages explicitly below.
   scoped.onDispose(unobserve);
 
   captureLoadedMessages();
@@ -2576,6 +3407,13 @@ export function onLoad() {
   );
   scoped.onDispose(stopMessageInterceptor);
 
+  const stopHistoryInterceptor = scoped.http.intercept(
+    "get",
+    (url) => historyCaptureEnabled() && /\/channels\/\d+\/messages(?:\?|$)/.test(url),
+    captureHistoryResponse,
+  );
+  scoped.onDispose(stopHistoryInterceptor);
+
   document.addEventListener("contextmenu", handleMessageContextMenu, true);
   scoped.onDispose(() => document.removeEventListener("contextmenu", handleMessageContextMenu, true));
   window.addEventListener("click", handleLivePhotoClick, true);
@@ -2584,29 +3422,133 @@ export function onLoad() {
   mountLauncher();
 }
 
+function CaptureExclusionSettings() {
+  const savedIds = (key) => Array.isArray(store[key]) ? store[key].join(", ") : asString(store[key]);
+  const [userIds, setUserIds] = createSignal(savedIds("ignoredUserIds"));
+  const [channelIds, setChannelIds] = createSignal(savedIds("ignoredChannelIds"));
+  const [guildIds, setGuildIds] = createSignal(savedIds("ignoredGuildIds"));
+  const updateIds = (key, value, setter) => {
+    const text = asString(value);
+    setter(text);
+    store[key] = [...new Set(text.split(/[\s,]+/).filter(Boolean))];
+    refreshHistoryCapture();
+  };
+  const updateToggle = (key, value) => {
+    store[key] = value;
+    refreshHistoryCapture();
+  };
+
+  return (
+    <section class="alexandria-scope" aria-label="Capture exclusions">
+      <SettingsSwitch
+        setting="ignoreBots"
+        onChange={(value) => updateToggle("ignoreBots", value)}
+        note="Skip messages authored by bots."
+      >
+        Ignore bot messages
+      </SettingsSwitch>
+      <SettingsSwitch
+        setting="ignoreSelf"
+        onChange={(value) => updateToggle("ignoreSelf", value)}
+        note="Skip messages sent by your current account."
+      >
+        Ignore your own messages
+      </SettingsSwitch>
+      <p class="alexandria-settings-note">
+        Exclude users, channels, or servers by Discord ID. Separate IDs with commas or spaces. Channel exclusions include their threads and category exclusions include their channels.
+      </p>
+      <label class="alexandria-settings-label" for="alexandria-ignored-users">Excluded user IDs</label>
+      <TextBox
+        id="alexandria-ignored-users"
+        value={userIds()}
+        placeholder="User IDs"
+        aria-label="Excluded user IDs"
+        onInput={(value) => updateIds("ignoredUserIds", value, setUserIds)}
+      />
+      <label class="alexandria-settings-label" for="alexandria-ignored-channels">Excluded channel or category IDs</label>
+      <TextBox
+        id="alexandria-ignored-channels"
+        value={channelIds()}
+        placeholder="Channel or category IDs"
+        aria-label="Excluded channel or category IDs"
+        onInput={(value) => updateIds("ignoredChannelIds", value, setChannelIds)}
+      />
+      <label class="alexandria-settings-label" for="alexandria-ignored-guilds">Excluded server IDs</label>
+      <TextBox
+        id="alexandria-ignored-guilds"
+        value={guildIds()}
+        placeholder="Server IDs"
+        aria-label="Excluded server IDs"
+        onInput={(value) => updateIds("ignoredGuildIds", value, setGuildIds)}
+      />
+    </section>
+  );
+}
+
+function SettingsSwitch(props) {
+  // Keep controlled inputs responsive even when the persisted store's Solid
+  // notification is delayed or absent. Storage still owns the saved value;
+  // the signal supplies immediate UI state, as in CaptureScopeSettings.
+  const [checked, setChecked] = createSignal(Boolean(store[props.setting]));
+  createEffect(() => setChecked(Boolean(store[props.setting])));
+
+  return (
+    <SwitchItem
+      checked={checked()}
+      onChange={(value) => {
+        const enabled = Boolean(value);
+        if (props.onChange) props.onChange(enabled);
+        else store[props.setting] = enabled;
+        setChecked(enabled);
+      }}
+      note={props.note}
+    >
+      {props.children}
+    </SwitchItem>
+  );
+}
+
 export const settings = () => (
   <div class="alexandria-settings">
-    <SwitchItem
-      checked={store.captureEnabled}
+    <SettingsSwitch
+      setting="captureEnabled"
       onChange={(value) => {
         store.captureEnabled = value;
+        refreshHistoryCapture();
       }}
       note="Alexandria can only preserve messages it sees while the plugin is enabled."
     >
       Capture messages
-    </SwitchItem>
+    </SettingsSwitch>
     <CaptureScopeSettings />
-    <SwitchItem
-      checked={store.showButton}
-      onChange={(value) => {
-        store.showButton = value;
-      }}
+    <SettingsSwitch
+      setting="logEdits"
+      note="Save previous text when a message changes, even before deletion. Keeps the latest 25 previous versions within 128 KB per message."
+    >
+      Log message edits
+    </SettingsSwitch>
+    <SettingsSwitch
+      setting="logDeletedAttachments"
+      note="Preserve up to 50 attachments removed by edits, including already cached photos. Edits and removed attachments enter the persistent archive."
+    >
+      Preserve removed attachments
+    </SettingsSwitch>
+    <CaptureExclusionSettings />
+    <SettingsSwitch
+      setting="experimentalHistoryEnabled"
+      onChange={setExperimentalHistoryEnabled}
+      note="Preloads 100 recent messages per channel in Selected scope and saves seen, undeleted text locally (2,000 messages / 16 MB, 7 days since last seen). Uses extra requests, memory and disk. Unseen messages and older photos may be missed. Turning off clears this cache."
+    >
+      Experimental older-message capture
+    </SettingsSwitch>
+    <SettingsSwitch
+      setting="showButton"
       note="The button only opens the archive; closing it hides the archive again."
     >
       Show Alexandria launcher
-    </SwitchItem>
-    <SwitchItem
-      checked={store.photoBackfillEnabled}
+    </SettingsSwitch>
+    <SettingsSwitch
+      setting="photoBackfillEnabled"
       onChange={(value) => {
         store.photoBackfillEnabled = value;
         if (value) backfillArchivedPhotos();
@@ -2614,13 +3556,13 @@ export const settings = () => (
       note="Try to save local copies of photos from earlier archive entries while their Discord media is still available. Downloads run three at a time."
     >
       Backfill archived photos
-    </SwitchItem>
+    </SettingsSwitch>
     <div class="alexandria-storage">
       <div class="alexandria-storage-heading">
         <span>Storage used</span>
         <strong>{formatBytes(storageBytes())}</strong>
       </div>
-      <p>Approximate archive storage, including disk-backed photos. The rolling archive is capped at 2,000 entries or 2 GB; temporary pre-delete photo staging is separately capped at 300 MB.</p>
+      <p>Approximate archive storage, including disk-backed photos. The rolling archive is capped at 2,000 entries, 16 MB of text/metadata or 2 GB including photos; temporary pre-delete photo staging is separately capped at 300 MB. Experimental history has a separate 16 MB text/metadata budget and is not included above.</p>
     </div>
     <div class="alexandria-settings-actions">
       <Button size={ButtonSizes.MIN} onClick={openArchive}>
@@ -2635,11 +3577,17 @@ export const settings = () => (
 
 export function onUnload() {
   pluginUnloading = true;
+  stopHistoryPreload();
   clearTimeout(archiveTrimTimer);
+  photoCaptureControllers.forEach(({ controller }) => controller.abort());
   photoCaptureQueue.length = 0;
   queuedPhotoCaptures.clear();
   for (const [messageId, preview] of [...visibleDeletedMessages]) {
-    releaseDeletedMessage(messageId, preview.channelId);
+    try {
+      releaseDeletedMessage(messageId, preview.channelId);
+    } catch (error) {
+      console.error("[Alexandria] Could not remove a retained message during unload", error);
+    }
   }
   visibleDeletedMessageBytes = 0;
   const pendingPhotoKeys = [...pendingMessages.values()].flatMap(entryPhotoKeys);
@@ -2653,6 +3601,9 @@ export function onUnload() {
   void (async () => {
     try {
       await deletePhotoBlobs(pendingPhotoKeys);
+      await historyWork;
+      historyMessages.clear();
+      historyMessageBytes = 0;
       while (activePhotoCaptures > 0) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }

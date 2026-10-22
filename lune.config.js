@@ -5,5 +5,8 @@
 import { defineConfig } from "@uwu/lune";
 
 export default defineConfig({
-  // configure lune here
+  ssg: {
+    repo_name: "Alexandria",
+    base_url: "https://chudforks.github.io/Alexandria",
+  },
 });

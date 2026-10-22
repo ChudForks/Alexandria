@@ -232,3 +232,31 @@
 @media (prefers-reduced-motion: reduce) {
   .alexandria-launcher, .alexandria-entry, .alexandria-photo img, .alexandria-photo-hint, .alexandria-deleted-message [class*="imageContainer"] { transition: none; }
 }
+.alexandria-edit-history {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-accent);
+  border-radius: 8px;
+}
+
+.alexandria-edit-history summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.alexandria-revision {
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 2px solid var(--text-muted);
+}
+
+.alexandria-revision time,
+.alexandria-removed-attachment > small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.alexandria-removed-attachment {
+  padding: 8px;
+  border-left: 2px solid var(--text-danger);
+}
