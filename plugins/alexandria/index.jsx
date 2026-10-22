@@ -1569,11 +1569,14 @@ function handleMessageContextMenu(event) {
   const target = event.target instanceof Element ? event.target : null;
   if (!target) return;
 
-  const messageElement = target.closest('[id^="message-"], [data-list-item-id^="chat-messages-"]');
-  const message = messageFromRenderedElement(messageElement);
-  if (!message?.id || !entries().some((entry) => entry.id === asString(message.id) && entry.deleted)) return;
+  // Header whitespace and row padding may have no message props of their own.
+  // The retained row's marker identifies the message across its whole surface.
+  const row = target.closest(".alexandria-deleted-message");
+  const messageElement = target.closest('[id^="message-"], [id^="chat-messages-"], [data-list-item-id^="chat-messages-"]');
+  const messageId = asString(row?.dataset.alexandriaMessageId || messageFromRenderedElement(messageElement)?.id);
+  if (!messageId || !entries().some((entry) => entry.id === messageId && entry.deleted)) return;
 
-  setTimeout(() => addArchiveContextMenuItem(message), 0);
+  setTimeout(() => addArchiveContextMenuItem({ id: messageId }), 0);
 }
 
 function SearchablePicker(props) {
