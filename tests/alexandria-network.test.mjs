@@ -15,6 +15,10 @@ function harness(overrides = {}) {
   const context = vm.createContext({
     pluginUnloading: false,
     archiveClearing: false,
+    asString: (value) => String(value ?? ""),
+    pendingMessages: new Map(),
+    entries: () => [],
+    historyEntry: () => null,
     messageFromPayload: (body) => body?.id ? body : null,
     channelIdFromUrl: (url) => url?.match(/\/channels\/(\d+)\/messages/)?.[1] || "",
     rememberMessage: (message) => captured.push(message),
@@ -40,6 +44,34 @@ test("sent-message capture sends once, captures the channel, and returns the exa
   assert.equal(h.captured[0].channel_id, "123");
   assert.equal(h.captured[0].content, "Sent");
 });
+
+for (const location of ["pending", "archive", "history"]) {
+  test(`a delayed send response preserves a newer ${location} snapshot`, async () => {
+    const pending = new Map();
+    const archive = [];
+    const history = new Map();
+    const h = harness({
+      pendingMessages: pending,
+      entries: () => archive,
+      historyEntry: (id) => history.get(id),
+    });
+    const response = { ok: true, body: { id: 456, content: "Original sent text" } };
+    let finish;
+    const result = h.intercept({ url: "/channels/123/messages" }, () => new Promise((resolve) => { finish = resolve; }));
+    const snapshot = { id: "456", content: "Newer edit", attachments: [{ id: "new-file" }] };
+    if (location === "pending") pending.set(snapshot.id, snapshot);
+    else if (location === "archive") archive.push(snapshot);
+    else history.set(snapshot.id, snapshot);
+    finish(response);
+
+    assert.equal(await result, response);
+    assert.equal(h.captured.length, 0, "Do not recapture stale text or restart photo downloads");
+    const retained = location === "pending" ? pending.get(snapshot.id) : location === "archive" ? archive[0] : history.get(snapshot.id);
+    assert.equal(retained, snapshot);
+    assert.equal(retained.content, "Newer edit");
+    assert.equal(h.errors.length, 0);
+  });
+}
 
 for (const boundary of ["messageFromPayload", "rememberMessage"]) {
   test(`a ${boundary} failure cannot reject a successful send`, async () => {

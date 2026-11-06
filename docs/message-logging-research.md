@@ -14,6 +14,14 @@ The [Shelter API reference](https://shelter.uwu.network/reference) establishes t
 - Assign a top-level store property when persisting archive changes. Deep mutations need `plugin.flushStore()`.
 - `observeDom(...).now()` stops observation immediately; it does not scan the existing document. An explicit startup scan is necessary.
 
+### Long-session storage subscriptions
+
+[Shelter's storage implementation](https://github.com/uwu/shelter/blob/main/packages/shelter-storage/index.ts) creates a signal and subscription on each ordinary property read, including nested archive reads. It registers cleanup with the current Solid owner. Flux, HTTP, timer and DOM callbacks generally have no owner, so repeatedly traversing the persistent store there can accumulate subscriptions even though the archive itself is bounded. Later store writes notify that growing graph, consuming CPU and retaining memory.
+
+The storage module's `signalOf` helper is internal: [Shelter's public window API](https://github.com/uwu/shelter/blob/main/packages/shelter/src/windowApi.ts) does not expose `shelter.storage`. Alexandria copies its JSON-compatible plugin data once at startup inside a temporary `createRoot`, disposing that root immediately to release all getter subscriptions, including nested reads. Its local storage facade forwards top-level writes to persistent storage and immediately updates a plain local snapshot, preserving create/edit/delete ordering and responsive settings while persistence notifications are deferred. All plugin controls and capture paths must use that facade; direct changes to the backing object are read again on the next plugin load. Nested updates still replace the top-level archive array.
+
+The offline regression replays 5,000 messages with edits and deletions. Before this change it crossed Shelter's subscription-allocating getters 86,283 times, excluding nested reads; afterward background capture performs no backing-store reads and retains no storage subscriptions. The test fixture deliberately omits internal storage APIs and models nested getter subscriptions to cover public-API startup and cleanup. This measures subscription behavior, not live Discord CPU or crash recovery.
+
 **Architectural limitation, inferred from the implementations:** returning `false` from Shelter's Flux interceptor suppresses a deletion for all subscribers, whereas Vencord patches selected message-store handlers. Retaining live deleted rows may therefore suppress other Discord cleanup too. Keep retention bounded, pass unknown/excluded IDs through normally, and verify unread indicators and navigation manually. This follows from the API reference and [Vencord's store patches](https://github.com/Vendicated/Vencord/blob/main/src/plugins/messageLogger/index.tsx); it is not a guarantee about Discord's current internal stores.
 
 ## Discord event and media behavior
@@ -53,3 +61,4 @@ Use a test conversation and messages you control. Offline tests cannot establish
 - [ ] Navigate between servers, DMs, and threads after deletion. Check red rows, unread indicators, reply previews, and normal message actions.
 - [ ] Disable/unload during photo downloads and a history request. Confirm retained rows and injected UI clean up, no late capture occurs, and normal sending/deletion continues after reload.
 - [ ] Clear the archive with history enabled. Confirm saved entries/photos disappear and a late response cannot refill it immediately.
+- [ ] Leave Discord capturing a busy conversation for a full day, both with the archive closed and after repeated opens. Compare idle and capture CPU/memory early and late in the session; confirm the archive still opens promptly and Discord does not restart. Repeat with experimental history enabled.

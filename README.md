@@ -96,4 +96,4 @@ Pushing to `main` runs the regression tests, builds the plugin and its website, 
 - Website: <https://chudforks.github.io/Alexandria/>
 - Shelter install URL: <https://chudforks.github.io/Alexandria/alexandria/>
 
-Current version: **0.9.0**
+Current version: **0.9.1**

@@ -1,6 +1,6 @@
 {
   "name": "Alexandria",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "author": "Chud.Dev",
   "description": "A bounded local archive for deleted messages, edit history and removed attachments. Open it from the floating Alexandria button or plugin settings."
 }

@@ -144,6 +144,33 @@ test("duplicate picker names select distinct IDs and keep the selected label in 
   view.close();
 });
 
+test("picker option refreshes preserve a draft while selection changes still update the input", () => {
+  const h = harness();
+  const [value, setValue] = solid.createSignal("first");
+  const [options, setOptions] = solid.createSignal([
+    { value: "first", label: "Alpha" },
+    { value: "second", label: "Beta" },
+  ]);
+  const view = h.mount("SearchablePicker", {
+    get value() { return value(); }, options, onChange: setValue,
+    id: "picker", placeholder: "All servers", ariaLabel: "Server",
+  });
+  const input = view.all("input")[0];
+  input.props.onInput({ currentTarget: { value: "Be" } });
+  setOptions([
+    { value: "first", label: "Alpha" },
+    { value: "second", label: "Beta" },
+    { value: "third", label: "Gamma" },
+  ]);
+  assert.equal(input.props.value, "Be", "A background archive update must not erase partial typing");
+  input.props.onInput({ currentTarget: { value: "Beta" } });
+  assert.equal(value(), "second");
+  assert.equal(input.props.value, "Beta");
+  setValue("first");
+  assert.equal(input.props.value, "Alpha", "An explicit selection change should still replace the draft");
+  view.close();
+});
+
 const row = (extra = {}) => ({
   id: "message", channelId: "channel-id", guildId: "guild-id", guildName: "Book club",
   channelName: "general", authorId: "user", author: "Alice", username: "alice",

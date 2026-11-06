@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import vm from "node:vm";
 
+const require = createRequire(import.meta.url);
+const shelterDependencies = createRequire(require.resolve("@uwu/shelter-defs/package.json"));
+const solid = shelterDependencies(join(dirname(shelterDependencies.resolve("solid-js/package.json")), "dist", "solid.cjs"));
 const source = readFileSync(new URL("../plugins/alexandria/index.jsx", import.meta.url), "utf8");
 // Execute the actual non-JSX plugin code, not a copy of its implementation.
 // UI rendering is excluded; browser/Shelter boundaries are modeled below.
@@ -136,7 +141,54 @@ function harness(options = {}) {
   }
   let nextTimer = 0;
   let nextUrl = 0;
-  const store = { archiveSchemaVersion: 2, ...options.store };
+  const storedValues = { archiveSchemaVersion: 2, ...options.store };
+  const store = {};
+  const storageListeners = new Set();
+  const storageMetrics = { propertyReads: 0, activeSubscriptions: 0, unownedReads: 0, writes: 0 };
+  let storageNotificationQueued = false;
+  const notifyStorage = () => {
+    storageNotificationQueued = false;
+    storageListeners.forEach((listener) => listener());
+  };
+  const defineStoreProperty = (key) => Object.defineProperty(store, key, {
+    enumerable: true, configurable: true,
+    get: () => storedValues[key],
+    set(value) {
+      storedValues[key] = value;
+      storageMetrics.writes++;
+      if (!options.deferStorageNotifications) notifyStorage();
+      else if (!storageNotificationQueued) {
+        storageNotificationQueued = true;
+        queueMicrotask(notifyStorage);
+      }
+    },
+  });
+  Object.keys(storedValues).forEach(defineStoreProperty);
+  const readStorageProperty = (target, key) => {
+    storageMetrics.propertyReads++;
+    storageMetrics.activeSubscriptions++;
+    if (!solid.getOwner()) storageMetrics.unownedReads++;
+    const wrap = (value) => value && typeof value === "object"
+      ? new Proxy(value, { get: readStorageProperty }) : value;
+    const [value, setValue] = solid.createSignal(wrap(target[key]));
+    const notify = () => setValue(() => wrap(target[key]));
+    storageListeners.add(notify);
+    solid.onCleanup(() => {
+      storageListeners.delete(notify);
+      storageMetrics.activeSubscriptions--;
+    });
+    return value();
+  };
+  const persistentStore = new Proxy(store, {
+    // Shelter's ordinary getters allocate subscriptions, even outside a Solid
+    // owner. Model nested getters too so startup copying must clean them up.
+    get: readStorageProperty,
+    set(target, key, value) {
+      if (!Object.hasOwn(target, key)) defineStoreProperty(key);
+      target[key] = value;
+      return true;
+    },
+  });
   const location = { pathname: "/channels/10/100" };
   const document = {
     getElementById: (id) => rows.get(id) || null,
@@ -169,8 +221,11 @@ function harness(options = {}) {
     static revokeObjectURL(url) { urls.delete(url); }
   }
   const context = vm.createContext({
+    ...solid,
     shelter: {
-      plugin: { store, scoped },
+      plugin: { store: persistentStore, scoped },
+      // Internal storage APIs are deliberately absent, as in Shelter's public
+      // window API. Supplying them here previously hid a real startup failure.
       ui: { openConfirmationModal: options.confirm || (async () => {}) },
       util: { getProps: (element) => ({ message: element.message }), getFiber: () => null, reactFiberWalker: () => null },
       http: { ready: Promise.resolve(), get: async (request) => {
@@ -225,9 +280,9 @@ function harness(options = {}) {
     globalThis.api = {
       rememberMessage, markDeleted, handleDispatch, clearArchive, onLoad, onUnload,
       captureRenderedMessage, markRenderedMessageDeleted, applyLivePhotoPreviews,
-      cachePhoto, cachePhotos, pendingMessages, visibleDeletedMessages, entries,
+      cachePhoto, cachePhotos, pendingMessages, visibleDeletedMessages, entries, pluginStore: store,
       setExperimentalHistoryEnabled, captureHistoryMessages, captureHistoryResponse,
-      initializeHistoryCache, refreshHistoryCapture, preloadHistoryChannel, historyEntry,
+      initializeHistoryCache, refreshHistoryCapture, preloadHistoryChannel, historyEntry, captureSentMessage,
       historyMessages, historyPreloadChannels,
       idleWork: () => Promise.all([livePreviewWork, historyWork]),
       state: () => ({ activePhotoCaptures, queued: photoCaptureQueue.length,
@@ -235,9 +290,17 @@ function harness(options = {}) {
         historyMessageBytes, historyLoaded, historyPreloadActive }),
     };`, context, { filename: "alexandria-core.js" });
   const api = context.api;
+  // Test setting changes use the same local facade as the plugin's settings UI.
+  // Keep a plain inspectable object so restart fixtures can structuredClone it.
+  const settingsView = {};
+  Object.keys(storedValues).forEach((key) => Object.defineProperty(settingsView, key, {
+    enumerable: true, configurable: true,
+    get: () => api.pluginStore[key],
+    set: (value) => { api.pluginStore[key] = value; },
+  }));
   return {
-    ...api, store, blobs, historyRows, messages, rows, urls, dispatches, requests, httpRequests,
-    httpInterceptors, errors, timers, timerDelays, clock, observers, location,
+    ...api, store: settingsView, persistentStore, storedValues, blobs, historyRows, messages, rows, urls, dispatches, requests, httpRequests,
+    httpInterceptors, errors, timers, timerDelays, clock, observers, location, storageMetrics,
     disk: { blobs, historyRows },
     addRow(value) { const row = fakeElement(value); rows.set(`chat-messages-${value.channel_id}-${value.id}`, row); return row; },
     dispose: () => disposers.forEach((dispose) => dispose()),
@@ -263,6 +326,77 @@ function harness(options = {}) {
     },
   };
 }
+
+test("startup restores nested archive data through the public plugin store and releases every getter subscription", () => {
+  const saved = {
+    id: "restored", channelId: "100", deleted: true, content: "Saved text",
+    attachments: [{ id: "photo", blobKey: "saved-photo", cachedBytes: 8 }],
+    editHistory: [{ content: "Previous text", editedAt: "2026-10-22T12:00:00Z" }],
+    embeds: [],
+  };
+  const h = harness({ store: { entries: [saved] } });
+  const reads = h.storageMetrics.propertyReads;
+  assert.ok(reads > 10, "The fixture must exercise nested storage getters");
+  assert.equal(h.storageMetrics.unownedReads, 0);
+  assert.equal(h.storageMetrics.activeSubscriptions, 0);
+  assert.equal(JSON.stringify(h.entries()[0]), JSON.stringify(saved));
+  assert.equal(h.entries()[0].attachments[0].blobKey, "saved-photo");
+  saved.content = "Changed outside the plugin";
+  assert.equal(h.entries()[0].content, "Saved text", "The local archive must contain plain copied values");
+  assert.equal(h.storageMetrics.propertyReads, reads, "Reading restored values must not revisit the backing store");
+  h.dispose();
+});
+
+test("a long message session retains no storage subscriptions or background persistent-store reads", async () => {
+  const h = harness();
+  const startupReads = h.storageMetrics.propertyReads;
+  assert.ok(startupReads > 0, "Startup must restore the stored data");
+  assert.equal(h.storageMetrics.activeSubscriptions, 0, "Startup reads must release their subscriptions");
+  h.onLoad();
+  for (let i = 0; i < 5_000; i++) {
+    h.handleDispatch({ type: "MESSAGE_CREATE", message: message(`session-${i}`) });
+    if (i % 100 === 0) {
+      h.handleDispatch({ type: "MESSAGE_UPDATE", message: { id: `session-${i}`, content: "Edited content" } });
+      h.markDeleted(`session-${i}`, "100");
+    }
+  }
+  await h.idle();
+  assert.equal(h.pendingMessages.size, 250);
+  assert.equal(h.entries().length, 50);
+  assert.equal(h.storageMetrics.propertyReads, startupReads, "Background work must use only the local snapshot");
+  assert.equal(h.storageMetrics.unownedReads, 0);
+  assert.equal(h.storageMetrics.activeSubscriptions, 0);
+  h.dispose();
+  assert.equal(h.storageMetrics.activeSubscriptions, 0);
+});
+
+test("storage snapshots keep same-tick edits and settings reactive before deferred persistence notifications", async () => {
+  const h = harness({ deferStorageNotifications: true });
+  const observed = [];
+  let close;
+  solid.createRoot((dispose) => {
+    close = dispose;
+    solid.createEffect(() => observed.push([h.pluginStore.captureEnabled, h.entries().length]));
+  });
+  h.rememberMessage(message("same-tick"));
+  h.handleDispatch({ type: "MESSAGE_UPDATE", message: { id: "same-tick", content: "Edited before notification" } });
+  assert.equal(h.entries()[0].content, "Edited before notification");
+  assert.equal(h.markDeleted("same-tick", "100"), true);
+  assert.equal(h.entries()[0].deleted, true);
+  h.pluginStore.captureEnabled = false;
+  assert.equal(h.pluginStore.captureEnabled, false);
+  assert.equal(h.rememberMessage(message("disabled-same-tick")), false);
+  assert.deepEqual(observed.at(-1), [false, 1]);
+  await h.idle();
+  assert.equal(h.storedValues.entries[0].deleted, true);
+  assert.equal(h.storedValues.captureEnabled, false);
+
+  h.store.captureEnabled = true;
+  await h.idle();
+  assert.deepEqual(observed.at(-1), [true, 1], "Changes from another plugin control must still reach the UI");
+  close();
+  h.dispose();
+});
 
 test("recapturing an archived photo preserves its original blob and skips downloads", async () => {
   const h = harness();
@@ -419,7 +553,7 @@ for (const type of ["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]) {
 test("a failed archive write lets Discord's original deletion continue", () => {
   const h = harness();
   h.messages.set("failed", message("failed"));
-  Object.defineProperty(h.store, "entries", { get: () => [], set: () => { throw new Error("Store unavailable"); } });
+  Object.defineProperty(h.persistentStore, "entries", { get: () => [], set: () => { throw new Error("Store unavailable"); } });
   assert.equal(h.handleDispatch({ type: "MESSAGE_DELETE", id: "failed", channel_id: "100" }), undefined);
   assert.equal(h.visibleDeletedMessages.size, 0);
 });
@@ -768,6 +902,28 @@ test("ordinary captures queued just before unload are flushed to history storage
   assert.equal(h.historyRows.has("queued-history"), true);
 });
 
+for (const type of ["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]) {
+  test(`${type} marks a deferred startup edit deleted after promotion to the archive`, async () => {
+    const first = harness({ store: experimentalStore() });
+    const original = message("hydration-deleted-edit");
+    first.captureHistoryMessages([original]);
+    await first.idle();
+    const second = harness({ disk: first.disk, store: experimentalStore() });
+    second.onLoad();
+    assert.equal(second.state().historyLoaded, false);
+    second.handleDispatch({ type: "MESSAGE_UPDATE", message: { id: original.id, content: "Edited before deletion" } });
+    second.handleDispatch({ type, id: original.id, ids: [original.id], channel_id: original.channel_id });
+    await second.idle();
+    const saved = second.store.entries[0];
+    assert.equal(saved.deleted, true);
+    assert.ok(Date.parse(saved.deletedAt));
+    assert.equal(saved.content, "Edited before deletion");
+    assert.equal(saved.editHistory[0].content, original.content);
+    assert.equal(second.historyRows.has(original.id), false);
+    second.dispose();
+  });
+}
+
 test("partial edits arriving during hydration preserve the persisted original before deletion", async () => {
   const first = harness({ store: experimentalStore() });
   first.captureHistoryMessages([message("hydration-edit", { attachments: [photo()], embeds: [{ title: "Keep embed" }] })]);
@@ -1019,6 +1175,27 @@ test("preloading fetches only selected readable text channels and DMs, not photo
   assert.equal(h.historyEntry("preload-/channels/300/messages").guildId, "");
   assert.equal(h.historyRows.size, 2);
   assert.ok(h.timerDelays.get([...h.timers].find(([, callback]) => callback === h.preloadHistoryChannel)[0]) >= 300_000);
+  h.dispose();
+});
+
+test("history preloading skips excluded servers, channels, categories, threads and DMs before making requests", async () => {
+  const h = harness({
+    channels: [
+      channel("100"), channel("101"), { ...channel("102"), parent_id: "150" },
+      { ...channel("103", "10", 11), parent_id: "101" }, channel("150", "10", 4),
+      channel("200", "20"), channel("300", "", 1), channel("301", "", 1),
+    ],
+    store: experimentalStore({
+      captureMode: "selected", selectedGuildIds: ["10", "20"], selectedDirectMessageIds: ["300", "301"],
+      ignoredGuildIds: ["20"], ignoredChannelIds: ["101", "150", "300"],
+    }),
+  });
+  h.onLoad();
+  assert.deepEqual(Array.from(h.historyPreloadChannels(), (entry) => entry.id), ["100", "301"]);
+  await h.runHistoryTimer();
+  await h.runHistoryTimer();
+  await h.idle();
+  assert.deepEqual(h.httpRequests.map((request) => request.url), ["/channels/100/messages", "/channels/301/messages"]);
   h.dispose();
 });
 
@@ -1566,6 +1743,27 @@ test("the first observed edit recovers its original from Discord's loaded store"
   assert.equal(h.store.entries[0].content, "Updated");
 });
 
+for (const logEdits of [true, false]) {
+  test(`a late send response preserves live edits with edit logging ${logEdits ? "on" : "off"}`, async () => {
+    const h = harness({ store: { logEdits, logDeletedAttachments: logEdits } });
+    const original = message("send-edit-race", { attachments: [{ id: "old", filename: "old.txt" }] });
+    const download = deferred();
+    const capture = h.captureSentMessage({ url: "/channels/100/messages" }, () => download.promise);
+    h.handleDispatch({ type: "MESSAGE_CREATE", message: original });
+    h.handleDispatch({ type: "MESSAGE_UPDATE", message: {
+      id: original.id, content: "Newer live edit", attachments: [{ id: "new", filename: "new.txt" }],
+    } });
+    const sentResponse = { ok: true, body: original };
+    download.resolve(sentResponse);
+    assert.equal(await capture, sentResponse);
+    await h.idle();
+    const saved = h.pendingMessages.get(original.id) || h.store.entries[0];
+    assert.equal(saved.content, "Newer live edit");
+    assert.deepEqual(Array.from(saved.attachments.filter((attachment) => !attachment.removedAt), (attachment) => attachment.id), ["new"]);
+    assert.equal(h.store.entries.length, logEdits ? 1 : 0);
+  });
+}
+
 test("duplicate updates, embeds and refreshed URLs do not create text revisions", async () => {
   const h = harness();
   const original = message("metadata-updates", { attachments: [photo()] });
@@ -1625,6 +1823,28 @@ test("removed attachment history retains the newest 50 attachments", async () =>
   assert.equal(saved.attachments.filter((attachment) => !attachment.removedAt).length, 10);
   await h.idle();
 });
+
+for (const cached of [true, false]) {
+  test(`deleted live previews omit removed attachments when their photo is ${cached ? "cached" : "unavailable"}`, async () => {
+    const h = harness({ fetch: (url) => !cached && url.includes("removed") ? { ok: false } : response() });
+    const original = message("deleted-attachment-history", { attachments: [photo("removed"), photo("kept")] });
+    h.rememberMessage(original);
+    await h.idle();
+    h.handleDispatch({ type: "MESSAGE_UPDATE", message: { id: original.id, attachments: [photo("kept")] } });
+    await h.idle();
+    h.messages.set(original.id, { ...original, attachments: [photo("kept")] });
+    assert.equal(h.handleDispatch({ type: "MESSAGE_DELETE", id: original.id, channel_id: original.channel_id }), false);
+    await h.idle();
+    const compacted = h.dispatches.filter((action) => action.alexandriaCompact).at(-1);
+    assert.ok(compacted, "Historical photos must not block compaction of current attachments");
+    assert.deepEqual(Array.from(compacted.message.attachments, (attachment) => attachment.id), ["kept"]);
+    assert.equal(h.visibleDeletedMessages.get(original.id).attachmentPreviews.length, 1);
+    assert.equal(h.urls.size, 1);
+    const historical = h.store.entries[0].attachments.find((attachment) => attachment.id === "removed");
+    assert.ok(historical.removedAt, "The removed attachment remains available in archive history");
+    assert.equal(Boolean(historical.blobKey), cached);
+  });
+}
 
 test("a removed photo whose download finishes after the edit attaches to its archived history", async () => {
   const download = deferred();

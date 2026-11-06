@@ -1,8 +1,8 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createRoot, createSignal, onCleanup, onMount } from "solid-js";
 import styles from "./styles.css";
 
 const {
-  plugin: { store, scoped },
+  plugin: { store: persistentStore, scoped },
   ui: {
     Button,
     ButtonColors,
@@ -22,6 +22,37 @@ const {
   },
   util: { getFiber, getProps, reactFiberWalker },
 } = shelter;
+
+function createStoreSnapshot() {
+  // Shelter's ordinary store getters create a subscription for every read,
+  // including nested array/entry reads. Flux and DOM callbacks have no Solid
+  // owner to clean those subscriptions up. Copy our JSON-compatible data once
+  // inside a temporary root, then release every getter subscription immediately.
+  // Storage's internal snapshot API is not exposed to plugins.
+  const initial = createRoot((dispose) => {
+    try {
+      return JSON.parse(JSON.stringify(persistentStore));
+    } finally {
+      dispose();
+    }
+  });
+  const [snapshot, setSnapshot] = createSignal(initial);
+
+  // All plugin settings and archive writes go through this local facade. Its
+  // plain values and stable signal keep background reads subscription-free.
+  return new Proxy({}, {
+    get: (_, key) => snapshot()[key],
+    set(_, key, value) {
+      persistentStore[key] = value;
+      // A create/edit/delete burst must see its own writes in this same turn,
+      // even when Shelter defers persistence notifications.
+      setSnapshot((current) => Object.is(current[key], value) ? current : { ...current, [key]: value });
+      return true;
+    },
+  });
+}
+
+const store = createStoreSnapshot();
 
 const ARCHIVE_KEY = "entries";
 const ARCHIVE_SCHEMA_VERSION = 2;
@@ -218,8 +249,9 @@ function removeReplacedPhotoBlobs(previous, next) {
   });
 }
 
-function photoCaptureAttachment(messageId, key) {
-  const entry = entries().find((item) => item.id === messageId) || pendingMessages.get(messageId);
+function photoCaptureAttachment(messageId, key, archiveById) {
+  const archived = archiveById ? archiveById.get(messageId) : entries().find((item) => item.id === messageId);
+  const entry = archived || pendingMessages.get(messageId);
   return entry?.attachments?.find((attachment) => attachmentKey(attachment) === key);
 }
 
@@ -394,7 +426,9 @@ function recoverHistoryDeletion(messageId, channelId) {
   const generation = historyGeneration;
   void initializeHistoryCache().then(() => {
     if (generation !== historyGeneration || pluginUnloading || archiveClearing) return;
-    const snapshot = historyEntry(messageId);
+    // A deferred edit can promote this snapshot into the archive while
+    // hydration finishes. Its deletion still needs to be applied there.
+    const snapshot = entries().find((entry) => entry.id === messageId) || historyEntry(messageId);
     if (snapshot && shouldCaptureMessage(snapshot, channelId)) markDeleted(messageId, channelId);
   }).catch((error) => console.error("[Alexandria] Could not archive a cached history message", error));
 }
@@ -484,6 +518,8 @@ function historyPreloadChannels() {
       const type = Number(candidate.type);
       if (sourceGuildId !== guildId || !/^\d+$/.test(id)) return;
       if (!(guildId ? [0, 5, 10, 11, 12] : [1, 3]).includes(type)) return;
+      // Excluded sources should not consume background requests or batch slots.
+      if (shouldIgnoreMessage({ channelId: id, guildId })) return;
       try {
         const permissions = fluxStores.PermissionStore;
         if (guildId && permissions?.can &&
@@ -782,7 +818,9 @@ async function applyCompactedRetainedMessage(messageId, channelId, message) {
 
   const archived = entries().find((entry) => entry.id === messageId);
   if (!archived) return;
-  const archivedAttachments = archived?.attachments || [];
+  // Removed attachments belong to archive history, not the final chat row.
+  // Their missing photos must not block previews of the current attachments.
+  const archivedAttachments = (archived.attachments || []).filter((attachment) => !attachment.removedAt);
   const sourceAttachments = Array.isArray(message?.attachments) ? message.attachments : archivedAttachments;
   const imageAttachments = archivedAttachments.filter((attachment) => attachment.isImage);
 
@@ -1506,14 +1544,12 @@ async function cachePhoto(messageId, attachment) {
   }
 }
 
-function cachePhotos(messageId, attachments) {
-  if (pluginUnloading || archiveClearing) return;
-  drainPhotoCaptureQueue();
+function queuePhotoCaptures(messageId, attachments, archiveById) {
   attachments.forEach((attachment) => {
     if (!attachment.isImage || attachment.blobKey) return;
 
     const key = attachmentKey(attachment);
-    const target = photoCaptureAttachment(messageId, key);
+    const target = photoCaptureAttachment(messageId, key, archiveById);
     if (!target?.isImage || target.blobKey) return;
     const captureKey = `${messageId}:${key}`;
     if (photoCapturesInFlight.has(captureKey) || queuedPhotoCaptures.has(captureKey)) return;
@@ -1521,7 +1557,7 @@ function cachePhotos(messageId, attachments) {
     if (photoCaptureQueue.length >= MAX_PHOTO_CAPTURE_QUEUE) {
       // Prefer persistent archive repairs over temporary pre-delete staging.
       // A full archive-only queue can be retried by a later backfill/repair.
-      const temporary = photoCaptureQueue.findIndex((job) => !entries().some((entry) => entry.id === job.messageId));
+      const temporary = photoCaptureQueue.findIndex((job) => !archiveById.has(job.messageId));
       if (temporary === -1) return;
       const [discarded] = photoCaptureQueue.splice(temporary, 1);
       queuedPhotoCaptures.delete(discarded.captureKey);
@@ -1529,29 +1565,39 @@ function cachePhotos(messageId, attachments) {
     queuedPhotoCaptures.add(captureKey);
     photoCaptureQueue.push({ messageId, attachment, captureKey });
   });
-
-  drainPhotoCaptureQueue();
 }
 
-function drainPhotoCaptureQueue() {
+function cachePhotos(messageId, attachments) {
+  if (pluginUnloading || archiveClearing) return;
+  if (!photoCaptureQueue.length && !photoCaptureControllers.size &&
+    !attachments.some((attachment) => attachment.isImage && !attachment.blobKey)) return;
+  const archiveById = new Map(entries().map((entry) => [entry.id, entry]));
+  drainPhotoCaptureQueue(archiveById);
+  queuePhotoCaptures(messageId, attachments, archiveById);
+  drainPhotoCaptureQueue(archiveById);
+}
+
+function drainPhotoCaptureQueue(archiveById) {
+  if (!photoCaptureQueue.length && !photoCaptureControllers.size) return;
+  archiveById ??= new Map(entries().map((entry) => [entry.id, entry]));
   // Pending entries can be evicted while all download slots are stalled. Drop
   // their work immediately, but keep attachments now owned by an archive entry.
   for (let index = photoCaptureQueue.length - 1; index >= 0; index--) {
     const job = photoCaptureQueue[index];
-    const target = photoCaptureAttachment(job.messageId, attachmentKey(job.attachment));
+    const target = photoCaptureAttachment(job.messageId, attachmentKey(job.attachment), archiveById);
     if (target?.isImage && !target.blobKey) continue;
     photoCaptureQueue.splice(index, 1);
     queuedPhotoCaptures.delete(job.captureKey);
   }
   for (const { controller, messageId, key } of photoCaptureControllers.values()) {
-    const target = photoCaptureAttachment(messageId, key);
+    const target = photoCaptureAttachment(messageId, key, archiveById);
     if (!target?.isImage || target.blobKey) controller.abort();
   }
   if (pluginUnloading) return;
   while (activePhotoCaptures < 3 && photoCaptureQueue.length) {
     const { messageId, attachment, captureKey } = photoCaptureQueue.shift();
     queuedPhotoCaptures.delete(captureKey);
-    const target = photoCaptureAttachment(messageId, attachmentKey(attachment));
+    const target = photoCaptureAttachment(messageId, attachmentKey(attachment), archiveById);
     if (!target?.isImage || target.blobKey) continue;
     activePhotoCaptures += 1;
 
@@ -1563,7 +1609,16 @@ function drainPhotoCaptureQueue() {
 }
 
 function backfillArchivedPhotos() {
-  entries().forEach((entry) => cachePhotos(entry.id, entry.attachments || []));
+  if (pluginUnloading || archiveClearing) return;
+  // A full archive can enqueue thousands of photos. Share one lookup and
+  // drain only to fill free slots, instead of rescanning the bounded queue
+  // twice for every entry while the download slots are already occupied.
+  const archiveById = new Map(entries().map((entry) => [entry.id, entry]));
+  drainPhotoCaptureQueue(archiveById);
+  archiveById.forEach((entry) => {
+    queuePhotoCaptures(entry.id, entry.attachments || [], archiveById);
+    if (activePhotoCaptures < 3) drainPhotoCaptureQueue(archiveById);
+  });
 }
 
 function mergeArchiveEntry(previous, incoming) {
@@ -2169,6 +2224,15 @@ async function captureSentMessage(request, send) {
   try {
     const responseMessage = messageFromPayload(response?.body);
     if (responseMessage) {
+      const messageId = asString(responseMessage.id);
+      // The response is a fallback for missed Gateway creates. An edit can
+      // arrive before this older send response, so keep any captured snapshot
+      // and avoid repeating its storage writes and photo downloads.
+      if (
+        pendingMessages.has(messageId) ||
+        entries().some((entry) => entry.id === messageId) ||
+        historyEntry(messageId)
+      ) return response;
       rememberMessage({
         ...responseMessage,
         channel_id: responseMessage.channel_id || channelIdFromUrl(request?.url),
@@ -2332,7 +2396,10 @@ function SearchablePicker(props) {
       return { ...option, label };
     });
   });
-  const selectedLabel = () => options().find((option) => option.value === props.value)?.label || "";
+  // Archive/photo updates can rebuild otherwise identical options while the
+  // user is typing. Only a changed selection or its displayed label should
+  // replace that draft input.
+  const selectedLabel = createMemo(() => options().find((option) => option.value === props.value)?.label || "");
   const [inputValue, setInputValue] = createSignal(selectedLabel());
 
   createEffect(() => {
